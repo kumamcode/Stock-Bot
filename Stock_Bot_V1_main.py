@@ -13,11 +13,29 @@ import yfinance as yf
 from email.mime.text import MIMEText
 from datetime import datetime
 from dotenv import load_dotenv
+import warnings
+
+# Suppress yfinance warnings and urllib3 warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+logging.getLogger('yfinance').setLevel(logging.ERROR)
+logging.getLogger('urllib3').setLevel(logging.ERROR)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s: %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 
 load_dotenv()  # loads .env into os.environ
 
 # ---------- LLM (local via Ollama) ----------
-def ask_llm(prompt: str, model: str = "llama3.2:3b") -> str:
+# Default model can be overridden via OLLAMA_MODEL env variable
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
+
+def ask_llm(prompt: str, model: str = None) -> str:
+    if model is None:
+        model = DEFAULT_MODEL
     r = requests.post(
         "http://localhost:11434/api/generate",
         json={"model": model, "prompt": prompt, "stream": False},
@@ -158,44 +176,84 @@ def summarize_reddit_sentiment(results: dict) -> str:
     ]
     return "\n".join(lines)
 
-def yf_snapshot(ticker: str) -> dict:
+def is_valid_ticker(ticker: str) -> bool:
+    """
+    Quick validation to check if a ticker exists and has data.
+    Returns False for invalid/delisted tickers.
+    Suppresses yfinance warnings during validation.
+    """
+    import io
+    import contextlib
+    
+    # Suppress stderr during validation to avoid yfinance error messages
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            t = yf.Ticker(ticker)
+            # Try to get a small amount of history data
+            hist = t.history(period="5d")
+            # If we get empty data, ticker is likely invalid
+            if hist is None or len(hist) == 0:
+                return False
+            # Check if we have price data
+            close = hist["Close"].dropna()
+            return len(close) > 0
+        except Exception:
+            return False
+
+def yf_snapshot(ticker: str) -> dict | None:
     """
     Lightweight snapshot: price/returns + a few fundamentals if available.
+    Returns None if ticker is invalid or data cannot be fetched.
+    Suppresses yfinance warnings during data fetching.
     """
-    t = yf.Ticker(ticker)
+    import io
+    import contextlib
+    
+    # Suppress stderr during fetch to avoid yfinance error messages
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            t = yf.Ticker(ticker)
 
-    # Price history (works reliably)
-    hist = t.history(period="6mo")
-    close = hist["Close"].dropna()
-    price = float(close.iloc[-1]) if len(close) else None
-    ret_1m = (float(close.iloc[-1]) / float(close.iloc[-21]) - 1.0) if len(close) >= 22 else None
-    ret_3m = (float(close.iloc[-1]) / float(close.iloc[-63]) - 1.0) if len(close) >= 64 else None
+            # Price history (works reliably)
+            hist = t.history(period="6mo")
+            if hist is None or len(hist) == 0:
+                return None
+            
+            close = hist["Close"].dropna()
+            if len(close) == 0:
+                return None
+                
+            price = float(close.iloc[-1]) if len(close) else None
+            ret_1m = (float(close.iloc[-1]) / float(close.iloc[-21]) - 1.0) if len(close) >= 22 else None
+            ret_3m = (float(close.iloc[-1]) / float(close.iloc[-63]) - 1.0) if len(close) >= 64 else None
 
-    # Fundamentals (sometimes missing / flaky—guard heavily)
-    info = {}
-    try:
-        info = t.get_info() or {}
-    except Exception:
-        info = {}
+            # Fundamentals (sometimes missing / flaky—guard heavily)
+            info = {}
+            try:
+                info = t.get_info() or {}
+            except Exception:
+                info = {}
 
-    def safe_get(k):
-        v = info.get(k)
-        return v if v is not None else None
+            def safe_get(k):
+                v = info.get(k)
+                return v if v is not None else None
 
-    return {
-        "ticker": ticker,
-        "price": price,
-        "ret_1m": ret_1m,
-        "ret_3m": ret_3m,
-        "marketCap": safe_get("marketCap"),
-        "trailingPE": safe_get("trailingPE"),
-        "forwardPE": safe_get("forwardPE"),
-        "dividendYield": safe_get("dividendYield"),
-        "beta": safe_get("beta"),
-        "sector": safe_get("sector"),
-        "industry": safe_get("industry"),
-        "longName": safe_get("longName"),
-    }
+            return {
+                "ticker": ticker,
+                "price": price,
+                "ret_1m": ret_1m,
+                "ret_3m": ret_3m,
+                "marketCap": safe_get("marketCap"),
+                "trailingPE": safe_get("trailingPE"),
+                "forwardPE": safe_get("forwardPE"),
+                "dividendYield": safe_get("dividendYield"),
+                "beta": safe_get("beta"),
+                "sector": safe_get("sector"),
+                "industry": safe_get("industry"),
+                "longName": safe_get("longName"),
+            }
+        except Exception:
+            return None
 
 def format_snapshots(snaps: list[dict]) -> str:
     lines = ["yfinance snapshots (for context; may be incomplete):"]
@@ -498,12 +556,23 @@ Headlines:
                     tickers.append(tt)
 
     # ---------- Fetch yfinance context ----------
-    snaps = []
+    # Filter out invalid tickers first to avoid noisy errors
+    valid_tickers = []
+    invalid_tickers = []
     for tk in tickers:
-        try:
-            snaps.append(yf_snapshot(tk))
-        except Exception:
-            snaps.append({"ticker": tk, "sector": "n/a", "price": None})
+        if is_valid_ticker(tk):
+            valid_tickers.append(tk)
+        else:
+            invalid_tickers.append(tk)
+    
+    if invalid_tickers:
+        logging.info(f"Skipping {len(invalid_tickers)} invalid ticker(s): {', '.join(invalid_tickers)}")
+    
+    snaps = []
+    for tk in valid_tickers:
+        snapshot = yf_snapshot(tk)
+        if snapshot is not None:
+            snaps.append(snapshot)
 
     yf_block = format_snapshots(snaps)
 
@@ -547,7 +616,7 @@ Selected tickers:
 
 
     subject = f"Daily Market Updates and Stock Picks({spx['date']})"
-    body = brief + "\n\n Not Financial Advice -> Stock Bot created by Kuma McCraw leveraging llama3.2:3b (3 billion params) locally."
+    body = brief + f"\n\n Not Financial Advice -> Stock Bot created by Kuma McCraw leveraging {DEFAULT_MODEL} locally."
     send_email(subject, body)
 
 if __name__ == "__main__":
