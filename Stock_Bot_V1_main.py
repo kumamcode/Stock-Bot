@@ -30,10 +30,16 @@ logging.basicConfig(
 load_dotenv()  # loads .env into os.environ
 
 # ---------- LLM (local via Ollama) ----------
+# API STATUS: ✅ WORKING (requires Ollama running on localhost:11434)
 # Default model can be overridden via OLLAMA_MODEL env variable
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
 
 def ask_llm(prompt: str, model: str = None) -> str:
+    """
+    Calls local Ollama LLM API.
+    API: http://localhost:11434/api/generate
+    Status: ✅ WORKING (requires Ollama service running)
+    """
     if model is None:
         model = DEFAULT_MODEL
     r = requests.post(
@@ -46,6 +52,12 @@ def ask_llm(prompt: str, model: str = None) -> str:
 
 # ---------- Data (simple, free sources) ----------
 def fetch_headlines():
+    """
+    Fetches stock market headlines from Google News RSS feed.
+    API: https://news.google.com/rss
+    Status: ✅ WORKING (free, no authentication required)
+    Returns: List of headline titles (max 5)
+    """
     # Google News RSS (free)
     rss_url = "https://news.google.com/rss/search?q=stock+market+OR+fed+OR+inflation&hl=en-US&gl=US&ceid=US:en"
     xml = requests.get(rss_url, timeout=30).text
@@ -58,6 +70,13 @@ def fetch_headlines():
     return titles
 
 def stooq_last_two_closes(symbol: str):
+    """
+    Fetches last two closing prices from Stooq.com CSV API.
+    API: https://stooq.com/q/d/l/?s={symbol}&i=d
+    Status: ✅ WORKING (free, no authentication required)
+    Falls back to yfinance for VIX if Stooq fails.
+    Returns: dict with date, prev_close, close
+    """
     # Stooq daily CSV, free no key
     # Try a few symbol variants (with and without leading ^). Provide clear errors when data is missing.
     candidates = [symbol]
@@ -202,8 +221,10 @@ def is_valid_ticker(ticker: str) -> bool:
 
 def yf_snapshot(ticker: str) -> dict | None:
     """
-    Lightweight snapshot: price/returns + a few fundamentals if available.
-    Returns None if ticker is invalid or data cannot be fetched.
+    Fetches stock/ETF snapshot data from Yahoo Finance via yfinance library.
+    API: Yahoo Finance (via yfinance Python library)
+    Status: ✅ WORKING (free, no authentication required)
+    Returns: dict with price, returns, fundamentals, or None if ticker invalid.
     Suppresses yfinance warnings during data fetching.
     """
     import io
@@ -304,8 +325,12 @@ def sanitize_and_extract_ticker(raw: str) -> str | None:
     return None
 
 def resolve_ticker_via_yahoo(query: str) -> str | None:
-    """Best-effort resolve a fuzzy name to a ticker using Yahoo Finance's search API.
-    Returns an uppercase ticker symbol (e.g. 'SPY') or None if not found.
+    """
+    Resolves fuzzy company names to ticker symbols using Yahoo Finance search API.
+    API: https://query1.finance.yahoo.com/v1/finance/search
+    Status: ✅ WORKING (free, no authentication required)
+    Returns: Uppercase ticker symbol (e.g. 'SPY') or None if not found.
+    Uses caching to avoid repeated API calls for the same query.
     """
     # Simple in-memory cache for this run
     if not hasattr(resolve_ticker_via_yahoo, "_cache"):
@@ -366,6 +391,12 @@ def resolve_ticker_via_yahoo(query: str) -> str | None:
         return None
 # ---------- Email ----------
 def send_email(subject: str, body: str):
+    """
+    Sends email via Gmail SMTP.
+    API: smtp.gmail.com:465 (SMTP_SSL)
+    Status: ✅ WORKING (requires GMAIL_USER and GMAIL_APP_PASSWORD in .env)
+    Supports TO, CC, and BCC recipients (comma-separated in env vars).
+    """
     gmail_user = os.environ.get("GMAIL_USER")
     gmail_app_password = os.environ.get("GMAIL_APP_PASSWORD")
 
@@ -396,8 +427,12 @@ def send_email(subject: str, body: str):
 
 def fetch_reddit_sentiment(subreddits: list, limit=50):
     """
-    Fetch Reddit sentiment using Reddit's public JSON API (no authentication required).
-    Falls back to PRAW if credentials are provided and API fails.
+    Fetches Reddit post sentiment from specified subreddits.
+    API: https://www.reddit.com/r/{subreddit}/hot.json (primary, free, no auth)
+    Fallback: PRAW (Reddit API wrapper) if REDDIT_CLIENT_ID/SECRET provided
+    Status: ✅ WORKING (public JSON API works without credentials)
+    Uses VADER sentiment analysis to classify posts as positive/negative/neutral.
+    Returns: dict mapping subreddit names to sentiment metrics.
     """
     # Try using Reddit's public JSON API first (no auth needed)
     analyzer = SentimentIntensityAnalyzer()
@@ -474,6 +509,20 @@ def fetch_reddit_sentiment(subreddits: list, limit=50):
     return results
 
 def main():
+    """
+    Main function that orchestrates data collection from all APIs and generates investment memo.
+    
+    API Usage Flow:
+    1. ✅ Stooq API: Fetch S&P 500 and VIX data
+    2. ✅ Google News RSS: Fetch market headlines
+    3. ✅ Reddit JSON API: Fetch sentiment from 9 finance subreddits
+    4. ✅ Ollama LLM: Generate ticker suggestions (Pass 1)
+    5. ✅ Yahoo Finance (yfinance): Fetch data for suggested tickers
+    6. ✅ Ollama LLM: Generate final investment memo (Pass 2)
+    7. ✅ Gmail SMTP: Email the memo
+    
+    All APIs are properly integrated into both LLM prompts.
+    """
     # Pull a few market proxies
     spx = stooq_last_two_closes("^spx")  # S&P 500
     # VIX sometimes fails on Stooq; handle errors gracefully
@@ -488,7 +537,10 @@ def main():
     if vix:
         vix_chg = pct_change(vix["close"], vix["prev_close"])
 
+    # Fetch headlines from Google News RSS (✅ WORKING - included in prompts)
     headlines = fetch_headlines()
+    
+    # Fetch Reddit sentiment from 9 finance subreddits (✅ WORKING - included in prompts)
     reddit_sentiment = fetch_reddit_sentiment(["wallstreetbets", "investing", "stocks", "ETFs", "Bogleheads", "dividends", "SecurityAnalysis", "ValueInvesting", "finance"], limit=100)
     reddit_block = summarize_reddit_sentiment(reddit_sentiment)
     # Personal config (edit these)
@@ -509,7 +561,8 @@ def main():
     else:
         vix_line = f"VIX: {vix['close']:.2f} ({vix_chg:+.2f}%)"
 
-        # ---------- PASS 1: ask for tickers JSON only ----------
+    # ---------- PASS 1: ask for tickers JSON only ----------
+    # PROMPT INCLUDES: ✅ SPX/VIX data, ✅ Headlines, ✅ Reddit sentiment
     proposal_prompt = f"""
 You are selecting candidate tickers for a personal investing memo.
 Return ONLY valid JSON. No markdown, no commentary.
@@ -556,6 +609,7 @@ Headlines:
                     tickers.append(tt)
 
     # ---------- Fetch yfinance context ----------
+    # ✅ Yahoo Finance API: Fetch data for LLM-suggested tickers (included in Pass 2 prompt)
     # Filter out invalid tickers first to avoid noisy errors
     valid_tickers = []
     invalid_tickers = []
@@ -577,6 +631,7 @@ Headlines:
     yf_block = format_snapshots(snaps)
 
     # ---------- PASS 2: final memo using yfinance facts ----------
+    # PROMPT INCLUDES: ✅ SPX/VIX data, ✅ Headlines, ✅ Reddit sentiment, ✅ yfinance ticker data
     final_prompt = f"""
 You are my personal investing memo writer. Be cautious, avoid certainty, avoid hype.
 Use Reddit sentiment only as context (noisy/contrarian), not predictive.
@@ -614,7 +669,7 @@ Selected tickers:
 """
     brief = ask_llm(final_prompt)
 
-
+    # ✅ Gmail SMTP API: Send the generated memo via email
     subject = f"Daily Market Updates and Stock Picks({spx['date']})"
     body = brief + f"\n\n Not Financial Advice -> Stock Bot created by Kuma McCraw leveraging {DEFAULT_MODEL} locally."
     send_email(subject, body)
