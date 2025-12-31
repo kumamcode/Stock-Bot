@@ -508,22 +508,44 @@ def markdown_to_html(text: str) -> str:
     """
     Convert markdown-style text to HTML for email formatting.
     Converts # headers, * bullet points, + sub-bullets, **bold**, numbered lists, etc. to proper HTML.
+    Detects sub-bullets when bullet points follow a line ending with ":" (e.g., "GOOGL: * item").
     """
     lines = text.split('\n')
     result_lines = []
     in_ul = False
     in_ol = False
     in_sub_ul = False  # Track nested sub-bullets
+    prev_line_ends_with_colon = False  # Track if previous line ended with colon
+    open_colon_list_item = False  # Track if we have an open list item from a colon line
     
     for i, line in enumerate(lines):
         stripped = line.strip()
         # Check for leading spaces to detect indentation level
         leading_spaces = len(line) - len(line.lstrip())
         
+        # Check if previous line ended with colon (indicates sub-bullets should follow)
+        # This helps detect patterns like "GOOGL:\n* item" where * should be a sub-bullet
+        prev_line_was_colon_list_item = False
+        if i > 0:
+            prev_line = lines[i-1].strip()
+            # Previous line ends with colon if it's not a header and ends with :
+            prev_line_ends_with_colon = (prev_line.endswith(':') and 
+                                        not prev_line.startswith('#') and
+                                        not re.match(r'^[\*\-\•\+]\s+', prev_line) and
+                                        not re.match(r'^\d+[\)\.]\s+', prev_line))
+            # Also check if the last output was a list item with colon (from our special handling)
+            if result_lines and '<strong>' in result_lines[-1] and result_lines[-1].endswith('</strong>'):
+                prev_line_was_colon_list_item = True
+        else:
+            prev_line_ends_with_colon = False
+        
         # Skip empty lines (will add spacing later)
         if not stripped:
             if in_sub_ul:
                 result_lines.append('</ul>')
+                if open_colon_list_item:
+                    result_lines.append('</li>')
+                    open_colon_list_item = False
                 in_sub_ul = False
             if in_ul:
                 result_lines.append('</ul>')
@@ -609,35 +631,102 @@ def markdown_to_html(text: str) -> str:
             content = re.sub(r'^\d+[\)\.]\s+', '', stripped)
             result_lines.append(f'<li>{content}</li>')
         # Main bullet points (*, -, •) - but not if it's indented (that's a sub-bullet)
+        # OR if previous line ended with colon (treat as sub-bullet)
         elif re.match(r'^[\*\-\•]\s+', stripped) and leading_spaces == 0:
-            if in_sub_ul:
-                result_lines.append('</ul>')
-                in_sub_ul = False
-            if in_ol:
-                result_lines.append('</ol>')
-                in_ol = False
-            if not in_ul:
-                result_lines.append('<ul>')
-                in_ul = True
-            # Remove the bullet and formatting
-            content = re.sub(r'^[\*\-\•]\s+', '', stripped)
-            result_lines.append(f'<li>{content}</li>')
+            # If previous line ended with colon or was a colon list item, treat this as a sub-bullet
+            if prev_line_ends_with_colon or prev_line_was_colon_list_item:
+                # Close any open lists first
+                if in_ol:
+                    result_lines.append('</ol>')
+                    in_ol = False
+                # If we're not in a main list, start one
+                if not in_ul:
+                    result_lines.append('<ul>')
+                    in_ul = True
+                # If we're in a main list but not in a sub-list, start nested list
+                if in_ul and not in_sub_ul:
+                    # Check if last item was a list item with colon (from our special handling)
+                    if prev_line_was_colon_list_item:
+                        # The list item is already open (no closing </li>), just start nested list
+                        result_lines.append('<ul>')
+                        in_sub_ul = True
+                    elif result_lines and result_lines[-1].endswith('</p>'):
+                        # Remove the </p> tag and wrap the content in a list item structure
+                        # Extract the paragraph content (remove <p> and </p>)
+                        para_content = result_lines[-1]
+                        para_text = re.sub(r'^<p>(.*)</p>$', r'\1', para_content)
+                        # Replace with a list item containing the text and we'll nest the sub-list
+                        result_lines[-1] = f'<li><strong>{para_text}</strong>'
+                        result_lines.append('<ul>')
+                        in_sub_ul = True
+                    elif result_lines and result_lines[-1].endswith('</li>'):
+                        # If it's already a list item, nest the sub-list inside it
+                        result_lines[-1] = result_lines[-1].replace('</li>', '')
+                        result_lines.append('<ul>')
+                        in_sub_ul = True
+                    else:
+                        # Start a new nested list
+                        result_lines.append('<ul>')
+                        in_sub_ul = True
+                # Remove the bullet and formatting
+                content = re.sub(r'^[\*\-\•]\s+', '', stripped)
+                result_lines.append(f'<li>{content}</li>')
+            else:
+                # Regular main bullet point
+                if in_sub_ul:
+                    result_lines.append('</ul>')
+                    in_sub_ul = False
+                if in_ol:
+                    result_lines.append('</ol>')
+                    in_ol = False
+                if not in_ul:
+                    result_lines.append('<ul>')
+                    in_ul = True
+                # Remove the bullet and formatting
+                content = re.sub(r'^[\*\-\•]\s+', '', stripped)
+                result_lines.append(f'<li>{content}</li>')
         # Regular paragraph
         else:
-            if in_sub_ul:
-                result_lines.append('</ul>')
-                in_sub_ul = False
-            if in_ul:
-                result_lines.append('</ul>')
-                in_ul = False
-            if in_ol:
-                result_lines.append('</ol>')
-                in_ol = False
-            result_lines.append(f'<p>{stripped}</p>')
+            # Check if this line ends with colon and next line is a bullet (special case for sub-bullets)
+            next_line_is_bullet = False
+            if i + 1 < len(lines):
+                next_line_stripped = lines[i + 1].strip()
+                next_line_is_bullet = bool(re.match(r'^[\*\-\•]\s+', next_line_stripped))
+            
+            if stripped.endswith(':') and next_line_is_bullet:
+                # This is a heading-like line followed by bullets - treat as list item with nested list
+                if in_sub_ul:
+                    result_lines.append('</ul>')
+                    in_sub_ul = False
+                if in_ol:
+                    result_lines.append('</ol>')
+                    in_ol = False
+                if not in_ul:
+                    result_lines.append('<ul>')
+                    in_ul = True
+                # Output as list item (we'll nest the bullets inside it)
+                result_lines.append(f'<li><strong>{stripped}</strong>')
+                open_colon_list_item = True  # Mark that we have an open list item
+            else:
+                # Regular paragraph
+                if in_sub_ul:
+                    result_lines.append('</ul>')
+                    in_sub_ul = False
+                if in_ul:
+                    result_lines.append('</ul>')
+                    in_ul = False
+                if in_ol:
+                    result_lines.append('</ol>')
+                    in_ol = False
+                result_lines.append(f'<p>{stripped}</p>')
     
     # Close any open lists
     if in_sub_ul:
         result_lines.append('</ul>')
+        # Close the parent list item if we have an open colon list item
+        if open_colon_list_item:
+            result_lines.append('</li>')
+            open_colon_list_item = False
     if in_ul:
         result_lines.append('</ul>')
     if in_ol:
@@ -987,12 +1076,14 @@ def get_company_name_to_ticker_map() -> dict:
 _ai_ticker_cache = {}
 _ai_ticker_call_count = 0  # Track number of AI calls to avoid rate limits
 _ai_ticker_last_call_time = 0  # Track last call time for rate limiting
+_ai_rate_limit_logged = False  # Track if we've already logged the rate limit message
 
 def reset_ai_ticker_call_count():
     """Reset the AI ticker call counter. Call this at the start of each bot run."""
-    global _ai_ticker_call_count, _ai_ticker_last_call_time
+    global _ai_ticker_call_count, _ai_ticker_last_call_time, _ai_rate_limit_logged
     _ai_ticker_call_count = 0
     _ai_ticker_last_call_time = 0
+    _ai_rate_limit_logged = False
 
 def guess_ticker_with_ai(company_name: str) -> str:
     """
@@ -1085,26 +1176,31 @@ Examples:
 def extract_potential_company_names(text: str) -> set:
     """
     Extracts potential company names from text that might not be in our static mapping.
-    Very conservative - only extracts names that really look like company names.
+    Less restrictive - extracts capitalized words/phrases that could be company names.
     """
     potential_names = set()
     
+    # Common words to skip
+    common_words = {'The', 'And', 'For', 'Are', 'But', 'Not', 'You', 'All', 'Can', 'Was', 
+                   'One', 'Our', 'Out', 'Day', 'Get', 'Has', 'Its', 'May', 'New', 'Now',
+                   'Old', 'See', 'Two', 'Who', 'Way', 'Use', 'Put', 'End', 'Did', 'Set',
+                   'Off', 'Try', 'Too', 'Any', 'Own', 'Ask', 'Yes', 'Let', 'Run', 'Far',
+                   'Top', 'How', 'Why', 'When', 'What', 'Where', 'That', 'This', 'They',
+                   'Them', 'These', 'Those', 'Have', 'Had', 'Will', 'Were', 'Said', 'Each',
+                   'Time', 'More', 'Very', 'Just', 'First', 'Also', 'After', 'Back', 'Other',
+                   'Many', 'Then', 'Would', 'Make', 'Like', 'Into', 'Look', 'Know', 'From',
+                   'With', 'Over', 'Most', 'Might', 'Been', 'Being', 'Only', 'Even', 'Right',
+                   'Left', 'Down', 'Take', 'Give', 'Made', 'Come', 'Went', 'Saw', 'Got',
+                   'Told', 'Asked', 'Think', 'Feel', 'Seem', 'Keep', 'Move', 'Turn', 'Show',
+                   'Hear', 'Play', 'Live', 'Work', 'Call', 'Tell', 'Need', 'Want', 'Find',
+                   'Help', 'Leave', 'Mean', 'Begin', 'Bring', 'Happen', 'Write', 'Sit',
+                   'Stand', 'Lose', 'Pay', 'Meet', 'Include', 'Continue', 'Set', 'Learn',
+                   'Change', 'Lead', 'Understand', 'Watch', 'Follow', 'Stop', 'Create',
+                   'Speak', 'Read', 'Allow', 'Add', 'Spend', 'Grow', 'Open', 'Walk', 'Win',
+                   'Offer', 'Remember', 'Love', 'Consider', 'Appear'}
+    
     # Pattern 1: Multi-word capitalized phrases (2-4 words) that look like company names
     # e.g., "Advanced Micro Devices", "General Motors", "Palantir Technologies"
-    # Must appear near finance keywords to be considered
-    finance_keywords = ['stock', 'stocks', 'share', 'shares', 'buy', 'sell', 'hold', 'trade', 
-                       'trading', 'invest', 'investment', 'company', 'corp', 'corporation',
-                       'earnings', 'revenue', 'profit', 'loss', 'dividend', 'IPO', 'ticker',
-                       'symbol', 'equity', 'equities', 'portfolio', 'position', 'long', 'short']
-    
-    text_lower = text.lower()
-    has_finance_context = any(keyword in text_lower for keyword in finance_keywords)
-    
-    if not has_finance_context:
-        # Only extract if there's clear finance context
-        return potential_names
-    
-    # Find multi-word capitalized phrases (2-4 words)
     multi_word_companies = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b', text)
     for name in multi_word_companies:
         words = name.split()
@@ -1117,12 +1213,12 @@ def extract_potential_company_names(text: str) -> set:
                           for w in words[1:-1]):
                     potential_names.add(name)
     
-    # Pattern 2: Single capitalized words ONLY if they appear with "stock", "company", "corp", etc.
-    # This is very conservative - only extract if explicitly mentioned as a company
-    company_indicators = ['stock', 'stocks', 'company', 'corp', 'corporation', 'inc', 'incorporated', 
-                         'ltd', 'limited', 'ticker', 'symbol']
-    
+    # Pattern 2: Single capitalized words that appear with company indicators
     # Look for patterns like "CompanyName stock" or "CompanyName company"
+    company_indicators = ['stock', 'stocks', 'company', 'corp', 'corporation', 'inc', 'incorporated', 
+                         'ltd', 'limited', 'ticker', 'symbol', 'buy', 'sell', 'hold', 'trade',
+                         'trading', 'invest', 'investment', 'earnings', 'revenue', 'profit', 'dividend']
+    
     for indicator in company_indicators:
         # Pattern: "CompanyName indicator" or "indicator CompanyName"
         pattern1 = r'\b([A-Z][a-z]{3,})\s+' + re.escape(indicator) + r'\b'
@@ -1132,26 +1228,21 @@ def extract_potential_company_names(text: str) -> set:
         matches2 = re.findall(pattern2, text, re.IGNORECASE)
         
         for match in matches1 + matches2:
-            if match and len(match) >= 4:  # At least 4 characters
-                # Skip common words
-                if match not in ['The', 'And', 'For', 'Are', 'But', 'Not', 'You', 'All', 'Can', 'Was', 
-                               'One', 'Our', 'Out', 'Day', 'Get', 'Has', 'Its', 'May', 'New', 'Now',
-                               'Old', 'See', 'Two', 'Who', 'Way', 'Use', 'Put', 'End', 'Did', 'Set',
-                               'Off', 'Try', 'Too', 'Any', 'Own', 'Ask', 'Yes', 'Let', 'Run', 'Far',
-                               'Top', 'How', 'Why', 'When', 'What', 'Where', 'That', 'This', 'They',
-                               'Them', 'These', 'Those', 'Have', 'Had', 'Will', 'Were', 'Said', 'Each',
-                               'Time', 'More', 'Very', 'Just', 'First', 'Also', 'After', 'Back', 'Other',
-                               'Many', 'Then', 'Would', 'Make', 'Like', 'Into', 'Look', 'Know', 'From',
-                               'With', 'Over', 'Most', 'Might', 'Been', 'Being', 'Only', 'Even', 'Right',
-                               'Left', 'Down', 'Take', 'Give', 'Made', 'Come', 'Went', 'Saw', 'Got',
-                               'Told', 'Asked', 'Think', 'Feel', 'Seem', 'Keep', 'Move', 'Turn', 'Show',
-                               'Hear', 'Play', 'Live', 'Work', 'Call', 'Tell', 'Need', 'Want', 'Find',
-                               'Help', 'Leave', 'Mean', 'Begin', 'Bring', 'Happen', 'Write', 'Sit',
-                               'Stand', 'Lose', 'Pay', 'Meet', 'Include', 'Continue', 'Set', 'Learn',
-                               'Change', 'Lead', 'Understand', 'Watch', 'Follow', 'Stop', 'Create',
-                               'Speak', 'Read', 'Allow', 'Add', 'Spend', 'Grow', 'Open', 'Walk', 'Win',
-                               'Offer', 'Remember', 'Love', 'Consider', 'Appear']:
-                    potential_names.add(match)
+            if match and len(match) >= 4 and match not in common_words:
+                potential_names.add(match)
+    
+    # Pattern 3: Capitalized words that appear multiple times (likely company names)
+    # This catches companies mentioned multiple times in a post
+    capitalized_words = re.findall(r'\b([A-Z][a-z]{3,})\b', text)
+    word_counts = {}
+    for word in capitalized_words:
+        if word not in common_words and len(word) >= 4:
+            word_counts[word] = word_counts.get(word, 0) + 1
+    
+    # If a capitalized word appears 2+ times, it might be a company name
+    for word, count in word_counts.items():
+        if count >= 2:
+            potential_names.add(word)
     
     return potential_names
 
@@ -1180,6 +1271,7 @@ def extract_company_names_from_text(text: str, use_ai: bool = None) -> set:
     # Step 2: Extract potential company names not in static mapping
     if use_ai:
         potential_names = extract_potential_company_names(text)
+        logging.debug(f"Extracted {len(potential_names)} potential company names: {potential_names}")
         
         # Filter out names we already found in static mapping
         found_in_static = set()
@@ -1192,6 +1284,7 @@ def extract_company_names_from_text(text: str, use_ai: bool = None) -> set:
         
         # Only use AI for names not in static mapping
         unknown_names = potential_names - found_in_static
+        logging.debug(f"Found {len(unknown_names)} unknown company names for AI processing: {unknown_names}")
         
         # Use AI to guess tickers (limit to avoid too many API calls)
         # Process up to 2 unknown names per text to avoid rate limits (reduced from 5)
@@ -1200,15 +1293,29 @@ def extract_company_names_from_text(text: str, use_ai: bool = None) -> set:
         # Check if we've already hit rate limits
         max_ai_calls_per_run = int(os.environ.get("MAX_AI_TICKER_CALLS_PER_RUN", "10"))
         if _ai_ticker_call_count >= max_ai_calls_per_run:
-            logging.debug("Skipping AI ticker guesses - rate limit reached")
+            # Only log once when rate limit is first hit
+            global _ai_rate_limit_logged
+            if not _ai_rate_limit_logged:
+                logging.info(f"AI ticker guessing rate limit reached ({_ai_ticker_call_count}/{max_ai_calls_per_run} calls). Skipping further AI ticker guesses for this run.")
+                _ai_rate_limit_logged = True
         else:
+            if unknown_names:
+                logging.info(f"Using AI to identify tickers for {min(len(unknown_names), max_ai_guesses)} company name(s)")
             for name in list(unknown_names)[:max_ai_guesses]:
                 # Double-check we haven't hit the limit
                 if _ai_ticker_call_count >= max_ai_calls_per_run:
+                    # Only log once if we haven't already logged
+                    if not _ai_rate_limit_logged:
+                        logging.info("Stopping AI ticker guesses - rate limit reached during processing")
+                        _ai_rate_limit_logged = True
                     break
+                logging.info(f"Attempting AI ticker identification for: '{name}'")
                 ticker = guess_ticker_with_ai(name)
                 if ticker:
+                    logging.info(f"✓ AI successfully identified '{name}' as ticker: {ticker}")
                     found_tickers.add(ticker)
+                else:
+                    logging.debug(f"✗ AI could not identify ticker for '{name}'")
     
     return found_tickers
 
