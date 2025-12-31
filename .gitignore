@@ -4,4 +4,5 @@ __pycache__/
 .DS_Store
 *.log
 .stockbot_run_today
+.failed_tickers.txt
 RUN_INSTRUCTIONS.md

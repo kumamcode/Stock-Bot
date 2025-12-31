@@ -234,12 +234,75 @@ def summarize_reddit_sentiment(results: dict) -> str:
     ]
     return "\n".join(lines)
 
+FAILED_TICKERS_FILE = ".failed_tickers.txt"
+_failed_tickers_cache = None
+
+def load_failed_tickers() -> set:
+    """
+    Load the list of failed tickers from disk.
+    Returns a set of ticker symbols (uppercase) that have previously failed validation.
+    """
+    global _failed_tickers_cache
+    
+    # Return cached version if already loaded
+    if _failed_tickers_cache is not None:
+        return _failed_tickers_cache
+    
+    _failed_tickers_cache = set()
+    
+    if os.path.exists(FAILED_TICKERS_FILE):
+        try:
+            with open(FAILED_TICKERS_FILE, 'r') as f:
+                for line in f:
+                    ticker = line.strip().upper()
+                    if ticker:
+                        _failed_tickers_cache.add(ticker)
+            logging.info(f"Loaded {len(_failed_tickers_cache)} failed tickers from cache")
+        except Exception as e:
+            logging.warning(f"Error loading failed tickers file: {e}")
+    
+    return _failed_tickers_cache
+
+def save_failed_ticker(ticker: str):
+    """
+    Add a ticker to the failed tickers list and save it to disk.
+    """
+    global _failed_tickers_cache
+    
+    ticker_upper = ticker.upper().strip()
+    if not ticker_upper:
+        return
+    
+    # Load if not already loaded
+    if _failed_tickers_cache is None:
+        load_failed_tickers()
+    
+    # Add to cache
+    if ticker_upper not in _failed_tickers_cache:
+        _failed_tickers_cache.add(ticker_upper)
+        
+        # Append to file
+        try:
+            with open(FAILED_TICKERS_FILE, 'a') as f:
+                f.write(ticker_upper + '\n')
+            logging.debug(f"Added {ticker_upper} to failed tickers list")
+        except Exception as e:
+            logging.warning(f"Error saving failed ticker {ticker_upper}: {e}")
+
 def is_valid_ticker(ticker: str) -> bool:
     """
     Quick validation to check if a ticker exists and has data.
     Returns False for invalid/delisted tickers.
+    Checks failed tickers cache first to avoid repeated API calls.
     Suppresses yfinance warnings during validation.
     """
+    ticker_upper = ticker.upper().strip()
+    
+    # Check failed tickers cache first
+    failed_tickers = load_failed_tickers()
+    if ticker_upper in failed_tickers:
+        return False
+    
     import io
     import contextlib
     
@@ -251,11 +314,16 @@ def is_valid_ticker(ticker: str) -> bool:
             hist = t.history(period="5d")
             # If we get empty data, ticker is likely invalid
             if hist is None or len(hist) == 0:
+                save_failed_ticker(ticker_upper)
                 return False
             # Check if we have price data
             close = hist["Close"].dropna()
-            return len(close) > 0
+            if len(close) == 0:
+                save_failed_ticker(ticker_upper)
+                return False
+            return True
         except Exception:
+            save_failed_ticker(ticker_upper)
             return False
 
 def yf_snapshot(ticker: str) -> dict | None:
@@ -683,41 +751,623 @@ def send_email(subject: str, body: str):
         server.login(gmail_user, gmail_app_password)
         server.sendmail(gmail_user, all_recipients, msg.as_string())
 
+def get_company_name_to_ticker_map() -> dict:
+    """
+    Returns a mapping of company names (and common variations) to their stock tickers.
+    This helps identify companies mentioned by name rather than ticker symbol.
+    """
+    return {
+        # Tech Giants
+        'APPLE': 'AAPL', 'APPLE INC': 'AAPL', 'APPLE COMPUTER': 'AAPL',
+        'MICROSOFT': 'MSFT', 'MS': 'MSFT',
+        'GOOGLE': 'GOOGL', 'ALPHABET': 'GOOGL', 'GOOG': 'GOOGL',
+        'AMAZON': 'AMZN', 'AMZN': 'AMZN',
+        'META': 'META', 'FACEBOOK': 'META', 'FB': 'META',
+        'TESLA': 'TSLA', 'TSLA': 'TSLA',
+        'NVIDIA': 'NVDA', 'NVIDIA CORP': 'NVDA',
+        'NETFLIX': 'NFLX',
+        'ADOBE': 'ADBE',
+        'SALESFORCE': 'CRM',
+        'ORACLE': 'ORCL',
+        'INTEL': 'INTC',
+        'AMD': 'AMD', 'ADVANCED MICRO DEVICES': 'AMD',
+        'IBM': 'IBM', 'INTERNATIONAL BUSINESS MACHINES': 'IBM',
+        'CISCO': 'CSCO',
+        'QUALCOMM': 'QCOM',
+        'BROADCOM': 'AVGO',
+        'PAYPAL': 'PYPL',
+        'UBER': 'UBER',
+        'LYFT': 'LYFT',
+        'SNAPCHAT': 'SNAP', 'SNAP': 'SNAP',
+        'TWITTER': 'TWTR', 'X': 'TWTR',
+        'TIKTOK': 'TIKTOK',  # Note: ByteDance, not directly traded
+        'SPOTIFY': 'SPOT',
+        'ZOOM': 'ZM',
+        'SHOPIFY': 'SHOP',
+        'SQUARE': 'SQ', 'BLOCK': 'SQ',
+        'ROBINHOOD': 'HOOD',
+        'COINBASE': 'COIN',
+        'PALANTIR': 'PLTR',
+        'SNOWFLAKE': 'SNOW',
+        'DOCKER': 'DOCKER',  # Note: Private company
+        'REDDIT': 'RDDT',  # Recently IPO'd
+        
+        # Finance
+        'JPMORGAN': 'JPM', 'JP MORGAN': 'JPM', 'JPM': 'JPM',
+        'BANK OF AMERICA': 'BAC', 'BOA': 'BAC', 'BAC': 'BAC',
+        'WELLS FARGO': 'WFC', 'WFC': 'WFC',
+        'GOLDMAN SACHS': 'GS', 'GS': 'GS',
+        'MORGAN STANLEY': 'MS', 'MS': 'MS',
+        'CITIGROUP': 'C', 'CITI': 'C',
+        'AMERICAN EXPRESS': 'AXP', 'AMEX': 'AXP',
+        'VISA': 'V',
+        'MASTERCARD': 'MA',
+        'BLACKROCK': 'BLK',
+        'CHARLES SCHWAB': 'SCHW',
+        'FIDELITY': 'FIDELITY',  # Private
+        'BERKSHIRE HATHAWAY': 'BRK.A', 'BERKSHIRE': 'BRK.A', 'BRK': 'BRK.A',
+        'BLACKSTONE': 'BX',
+        
+        # Consumer
+        'WALMART': 'WMT',
+        'TARGET': 'TGT',
+        'COSTCO': 'COST',
+        'HOME DEPOT': 'HD',
+        'LOWES': 'LOW',
+        'NIKE': 'NKE',
+        'STARBUCKS': 'SBUX',
+        'MCDONALDS': 'MCD', 'MCDONALDS': 'MCD',
+        'COCA COLA': 'KO', 'COKE': 'KO',
+        'PEPSI': 'PEP',
+        'DISNEY': 'DIS', 'WALT DISNEY': 'DIS',
+        'NFLX': 'NFLX',  # Netflix already covered
+        'PROCTER & GAMBLE': 'PG', 'P&G': 'PG',
+        'JOHNSON & JOHNSON': 'JNJ', 'J&J': 'JNJ',
+        'UNILEVER': 'UL',
+        'NESTLE': 'NSRGY',
+        
+        # Energy
+        'EXXON': 'XOM', 'EXXON MOBIL': 'XOM',
+        'CHEVRON': 'CVX',
+        'SHELL': 'SHEL',
+        'BP': 'BP',
+        'CONOCOPHILLIPS': 'COP',
+        
+        # Healthcare
+        'PFIZER': 'PFE',
+        'MODERNA': 'MRNA',
+        'BIONTECH': 'BNTX',
+        'JOHNSON & JOHNSON': 'JNJ', 'J&J': 'JNJ',
+        'UNITEDHEALTH': 'UNH', 'UNITED HEALTH': 'UNH',
+        'CVS': 'CVS',
+        'WALGREENS': 'WBA',
+        'ABBVIE': 'ABBV',
+        'MERCK': 'MRK',
+        'ABBOTT': 'ABT',
+        'BRISTOL MYERS': 'BMY', 'BRISTOL-MYERS': 'BMY',
+        'GILEAD': 'GILD',
+        
+        # Automotive
+        'FORD': 'F',
+        'GENERAL MOTORS': 'GM', 'GM': 'GM',
+        'STELLANTIS': 'STLA', 'FIAT CHRYSLER': 'STLA',
+        'TOYOTA': 'TM',
+        'HONDA': 'HMC',
+        'VOLKSWAGEN': 'VWAGY',
+        'FERRARI': 'RACE',
+        'RIVIAN': 'RIVN',
+        'LUCID': 'LCID',
+        'FISKER': 'FSR',
+        'NIO': 'NIO',
+        'XPENG': 'XPEV',
+        'LI AUTO': 'LI',
+        
+        # Aerospace & Defense
+        'BOEING': 'BA',
+        'LOCKHEED MARTIN': 'LMT',
+        'RAYTHEON': 'RTX',
+        'NORTHROP GRUMMAN': 'NOC',
+        'GENERAL DYNAMICS': 'GD',
+        
+        # Industrial
+        'CATERPILLAR': 'CAT',
+        'DEERE': 'DE', 'JOHN DEERE': 'DE',
+        '3M': 'MMM',
+        'GENERAL ELECTRIC': 'GE',
+        'HONEYWELL': 'HON',
+        'UNITED PARCEL SERVICE': 'UPS', 'UPS': 'UPS',
+        'FEDEX': 'FDX',
+        
+        # Telecom
+        'VERIZON': 'VZ',
+        'AT&T': 'T', 'ATT': 'T',
+        'T-MOBILE': 'TMUS', 'TMUS': 'TMUS',
+        'SPRINT': 'S',  # Merged with T-Mobile
+        
+        # Media & Entertainment
+        'WARNER BROS': 'WBD', 'WARNER BROTHERS': 'WBD', 'WARNERMEDIA': 'WBD',
+        'PARAMOUNT': 'PARA',
+        'SONY': 'SONY',
+        'COMCAST': 'CMCSA',
+        'FOX': 'FOX', 'FOX CORP': 'FOX',
+        'NEWS CORP': 'NWSA',
+        
+        # Retail & E-commerce
+        'EBAY': 'EBAY',
+        'ETSY': 'ETSY',
+        'WAYFAIR': 'W',
+        'CHEWY': 'CHWY',
+        'PETCO': 'WOOF',
+        'BEST BUY': 'BBY',
+        'GAMESTOP': 'GME', 'GME': 'GME',
+        'AMC': 'AMC', 'AMC ENTERTAINMENT': 'AMC',
+        'BED BATH & BEYOND': 'BBBY',
+        'NORDSTROM': 'JWN',
+        'MACYS': 'M',
+        
+        # Food & Beverage
+        'YUM BRANDS': 'YUM', 'YUM': 'YUM',  # KFC, Pizza Hut, Taco Bell
+        'DOMINOS': 'DPZ',
+        'CHIPOTLE': 'CMG',
+        'SHAKE SHACK': 'SHAK',
+        'DUNKIN': 'DNKN',
+        
+        # Travel & Hospitality
+        'AIRBNB': 'ABNB',
+        'BOOKING': 'BKNG', 'BOOKING.COM': 'BKNG', 'PCLN': 'BKNG',
+        'EXPEDIA': 'EXPE',
+        'MARRIOTT': 'MAR',
+        'HILTON': 'HLT',
+        'DELTA': 'DAL',
+        'AMERICAN AIRLINES': 'AAL',
+        'UNITED AIRLINES': 'UAL',
+        'SOUTHWEST': 'LUV',
+        'JETBLUE': 'JBLU',
+        'CRUISE': 'CRUISE',  # Note: Private (GM subsidiary)
+        
+        # Semiconductors
+        'TSMC': 'TSM', 'TAIWAN SEMICONDUCTOR': 'TSM',
+        'ASML': 'ASML',
+        'APPLIED MATERIALS': 'AMAT',
+        'LAM RESEARCH': 'LRCX',
+        'KLA': 'KLAC',
+        'MICRON': 'MU',
+        'SK HYNIX': 'SKHYNIX',  # Note: Korean, not directly traded
+        'SAMSUNG': 'SSNLF',  # Note: Korean, OTC
+        
+        # Gaming
+        'ACTIVISION': 'ATVI',  # Acquired by Microsoft
+        'ELECTRONIC ARTS': 'EA', 'EA': 'EA',
+        'TAKE-TWO': 'TTWO', 'TAKE TWO': 'TTWO',
+        'UBISOFT': 'UBSFY',
+        'ROBLOX': 'RBLX',
+        'UNITY': 'U',
+        'EPIC GAMES': 'EPIC',  # Note: Private
+        
+        # Cryptocurrency & Blockchain
+        'MICROSTRATEGY': 'MSTR',
+        'MARATHON': 'MARA', 'MARATHON DIGITAL': 'MARA',
+        'RIOT': 'RIOT', 'RIOT BLOCKCHAIN': 'RIOT',
+        'SQUARE': 'SQ',  # Already covered, but also Block
+        'SILVERGATE': 'SI',
+        'SIGNATURE BANK': 'SBNY',  # Note: Closed
+        
+        # AI & Machine Learning
+        'C3.AI': 'AI',
+        'PALANTIR': 'PLTR',  # Already covered
+        'BAIDU': 'BIDU',
+        'ALIBABA': 'BABA',
+        'TENCENT': 'TCEHY',
+        
+        # Electric Vehicles (additional)
+        'FORD': 'F',  # Already covered, but also making EVs
+        'GENERAL MOTORS': 'GM',  # Already covered
+        'VOLVO': 'VOLVY',
+        'POLESTAR': 'PSNY',
+        
+        # Space
+        'SPACEX': 'SPACEX',  # Note: Private
+        'BLUE ORIGIN': 'BLUE',  # Note: Private
+        'VIRGIN GALACTIC': 'SPCE',
+        'ASTRA': 'ASTR',
+        'Rocket Lab': 'RKLB',
+        
+        # Other Notable
+        'DOORDASH': 'DASH',
+        'GRUBHUB': 'GRUB',
+        'INSTACART': 'CART',
+        'PELOTON': 'PTON',
+        'LULULEMON': 'LULU',
+        'UNDER ARMOUR': 'UAA',
+        'VANS': 'VANS',  # Note: Owned by VF Corp
+        'PATAGONIA': 'PATAGONIA',  # Note: Private
+    }
+
+# Cache for AI-generated ticker mappings (to avoid repeated API calls)
+_ai_ticker_cache = {}
+_ai_ticker_call_count = 0  # Track number of AI calls to avoid rate limits
+_ai_ticker_last_call_time = 0  # Track last call time for rate limiting
+
+def reset_ai_ticker_call_count():
+    """Reset the AI ticker call counter. Call this at the start of each bot run."""
+    global _ai_ticker_call_count, _ai_ticker_last_call_time
+    _ai_ticker_call_count = 0
+    _ai_ticker_last_call_time = 0
+
+def guess_ticker_with_ai(company_name: str) -> str:
+    """
+    Uses AI to guess the stock ticker for a company name.
+    Returns the ticker if found, None otherwise.
+    Caches results to avoid repeated API calls.
+    Includes rate limiting to avoid hitting API limits.
+    """
+    global _ai_ticker_call_count, _ai_ticker_last_call_time
+    
+    company_name_upper = company_name.upper().strip()
+    
+    # Check cache first
+    if company_name_upper in _ai_ticker_cache:
+        return _ai_ticker_cache[company_name_upper]
+    
+    # Skip if it's too short or looks like a common word
+    if len(company_name) < 3 or company_name_upper in ['THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL']:
+        _ai_ticker_cache[company_name_upper] = None
+        return None
+    
+    # Rate limiting: Check max calls per run
+    max_ai_calls_per_run = int(os.environ.get("MAX_AI_TICKER_CALLS_PER_RUN", "10"))
+    if _ai_ticker_call_count >= max_ai_calls_per_run:
+        logging.debug(f"Skipping AI ticker guess for '{company_name}' - max calls ({max_ai_calls_per_run}) reached")
+        _ai_ticker_cache[company_name_upper] = None
+        return None
+    
+    # Rate limiting: Add delay between calls (at least 1 second)
+    current_time = time.time()
+    time_since_last_call = current_time - _ai_ticker_last_call_time
+    min_delay = float(os.environ.get("AI_TICKER_CALL_DELAY", "1.5"))  # Default 1.5 seconds between calls
+    if time_since_last_call < min_delay:
+        time.sleep(min_delay - time_since_last_call)
+    
+    _ai_ticker_call_count += 1
+    _ai_ticker_last_call_time = time.time()
+    
+    try:
+        prompt = f"""What is the stock ticker symbol for the company "{company_name}"?
+
+Please respond with ONLY the ticker symbol (e.g., AAPL, TSLA, MSFT) if the company is publicly traded on a major US stock exchange (NYSE, NASDAQ).
+If the company is not publicly traded, private, delisted, or you're not sure, respond with "NONE".
+Do not include any explanation, just the ticker symbol or "NONE".
+
+Examples:
+- "Apple" -> AAPL
+- "Tesla" -> TSLA
+- "Microsoft" -> MSFT
+- "Private Company Inc" -> NONE"""
+
+        response = ask_llm(prompt).strip().upper()
+        
+        # Parse response - should be just the ticker or "NONE"
+        if response == "NONE" or not response:
+            _ai_ticker_cache[company_name_upper] = None
+            return None
+        
+        # Extract ticker (should be 1-5 uppercase letters)
+        ticker_match = re.match(r'^([A-Z]{1,5})$', response)
+        if ticker_match:
+            ticker = ticker_match.group(1)
+            # Validate the ticker exists
+            if is_valid_ticker(ticker):
+                _ai_ticker_cache[company_name_upper] = ticker
+                logging.info(f"AI identified '{company_name}' as ticker: {ticker}")
+                return ticker
+            else:
+                _ai_ticker_cache[company_name_upper] = None
+                return None
+        else:
+            # Response wasn't a valid ticker format
+            _ai_ticker_cache[company_name_upper] = None
+            return None
+            
+    except Exception as e:
+        error_str = str(e).upper()
+        # Check if it's a rate limit error
+        if "429" in error_str or "TOO MANY REQUESTS" in error_str or "RATE LIMIT" in error_str:
+            logging.warning(f"Rate limit hit while guessing ticker for '{company_name}'. Disabling AI ticker guessing for this run.")
+            # Set max calls to current count to stop further attempts
+            _ai_ticker_call_count = max_ai_calls_per_run
+            _ai_ticker_cache[company_name_upper] = None
+            return None
+        else:
+            logging.warning(f"Error using AI to guess ticker for '{company_name}': {e}")
+            _ai_ticker_cache[company_name_upper] = None
+            return None
+
+def extract_potential_company_names(text: str) -> set:
+    """
+    Extracts potential company names from text that might not be in our static mapping.
+    Very conservative - only extracts names that really look like company names.
+    """
+    potential_names = set()
+    
+    # Pattern 1: Multi-word capitalized phrases (2-4 words) that look like company names
+    # e.g., "Advanced Micro Devices", "General Motors", "Palantir Technologies"
+    # Must appear near finance keywords to be considered
+    finance_keywords = ['stock', 'stocks', 'share', 'shares', 'buy', 'sell', 'hold', 'trade', 
+                       'trading', 'invest', 'investment', 'company', 'corp', 'corporation',
+                       'earnings', 'revenue', 'profit', 'loss', 'dividend', 'IPO', 'ticker',
+                       'symbol', 'equity', 'equities', 'portfolio', 'position', 'long', 'short']
+    
+    text_lower = text.lower()
+    has_finance_context = any(keyword in text_lower for keyword in finance_keywords)
+    
+    if not has_finance_context:
+        # Only extract if there's clear finance context
+        return potential_names
+    
+    # Find multi-word capitalized phrases (2-4 words)
+    multi_word_companies = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b', text)
+    for name in multi_word_companies:
+        words = name.split()
+        # Filter: must be 2-4 words, and not common phrases
+        if 2 <= len(words) <= 4:
+            # Skip if it starts with common words
+            if words[0] not in ['The', 'A', 'An', 'And', 'Or', 'But', 'For', 'With', 'From', 'To']:
+                # Skip if it contains common connecting words in the middle
+                if not any(w.lower() in ['the', 'and', 'or', 'but', 'for', 'with', 'from', 'to', 'of', 'in', 'on', 'at'] 
+                          for w in words[1:-1]):
+                    potential_names.add(name)
+    
+    # Pattern 2: Single capitalized words ONLY if they appear with "stock", "company", "corp", etc.
+    # This is very conservative - only extract if explicitly mentioned as a company
+    company_indicators = ['stock', 'stocks', 'company', 'corp', 'corporation', 'inc', 'incorporated', 
+                         'ltd', 'limited', 'ticker', 'symbol']
+    
+    # Look for patterns like "CompanyName stock" or "CompanyName company"
+    for indicator in company_indicators:
+        # Pattern: "CompanyName indicator" or "indicator CompanyName"
+        pattern1 = r'\b([A-Z][a-z]{3,})\s+' + re.escape(indicator) + r'\b'
+        pattern2 = r'\b' + re.escape(indicator) + r'\s+([A-Z][a-z]{3,})\b'
+        
+        matches1 = re.findall(pattern1, text, re.IGNORECASE)
+        matches2 = re.findall(pattern2, text, re.IGNORECASE)
+        
+        for match in matches1 + matches2:
+            if match and len(match) >= 4:  # At least 4 characters
+                # Skip common words
+                if match not in ['The', 'And', 'For', 'Are', 'But', 'Not', 'You', 'All', 'Can', 'Was', 
+                               'One', 'Our', 'Out', 'Day', 'Get', 'Has', 'Its', 'May', 'New', 'Now',
+                               'Old', 'See', 'Two', 'Who', 'Way', 'Use', 'Put', 'End', 'Did', 'Set',
+                               'Off', 'Try', 'Too', 'Any', 'Own', 'Ask', 'Yes', 'Let', 'Run', 'Far',
+                               'Top', 'How', 'Why', 'When', 'What', 'Where', 'That', 'This', 'They',
+                               'Them', 'These', 'Those', 'Have', 'Had', 'Will', 'Were', 'Said', 'Each',
+                               'Time', 'More', 'Very', 'Just', 'First', 'Also', 'After', 'Back', 'Other',
+                               'Many', 'Then', 'Would', 'Make', 'Like', 'Into', 'Look', 'Know', 'From',
+                               'With', 'Over', 'Most', 'Might', 'Been', 'Being', 'Only', 'Even', 'Right',
+                               'Left', 'Down', 'Take', 'Give', 'Made', 'Come', 'Went', 'Saw', 'Got',
+                               'Told', 'Asked', 'Think', 'Feel', 'Seem', 'Keep', 'Move', 'Turn', 'Show',
+                               'Hear', 'Play', 'Live', 'Work', 'Call', 'Tell', 'Need', 'Want', 'Find',
+                               'Help', 'Leave', 'Mean', 'Begin', 'Bring', 'Happen', 'Write', 'Sit',
+                               'Stand', 'Lose', 'Pay', 'Meet', 'Include', 'Continue', 'Set', 'Learn',
+                               'Change', 'Lead', 'Understand', 'Watch', 'Follow', 'Stop', 'Create',
+                               'Speak', 'Read', 'Allow', 'Add', 'Spend', 'Grow', 'Open', 'Walk', 'Win',
+                               'Offer', 'Remember', 'Love', 'Consider', 'Appear']:
+                    potential_names.add(match)
+    
+    return potential_names
+
+def extract_company_names_from_text(text: str, use_ai: bool = None) -> set:
+    """
+    Extract company names from text and map them to tickers.
+    First checks static mapping, then uses AI for unknown companies if use_ai=True.
+    Can be disabled via USE_AI_TICKER_GUESS env variable (set to "false" to disable).
+    """
+    # Check environment variable if use_ai not explicitly set
+    if use_ai is None:
+        use_ai_env = os.environ.get("USE_AI_TICKER_GUESS", "true").lower()
+        use_ai = use_ai_env not in ["false", "0", "no", "off"]
+    
+    text_upper = text.upper()
+    company_map = get_company_name_to_ticker_map()
+    found_tickers = set()
+    
+    # Step 1: Check static mapping (fast, no API calls)
+    for company_name, ticker in company_map.items():
+        # Use word boundaries to avoid partial matches
+        pattern = r'\b' + re.escape(company_name) + r'\b'
+        if re.search(pattern, text_upper):
+            found_tickers.add(ticker)
+    
+    # Step 2: Extract potential company names not in static mapping
+    if use_ai:
+        potential_names = extract_potential_company_names(text)
+        
+        # Filter out names we already found in static mapping
+        found_in_static = set()
+        for name in potential_names:
+            name_upper = name.upper()
+            for company_name in company_map.keys():
+                if name_upper in company_name or company_name in name_upper:
+                    found_in_static.add(name)
+                    break
+        
+        # Only use AI for names not in static mapping
+        unknown_names = potential_names - found_in_static
+        
+        # Use AI to guess tickers (limit to avoid too many API calls)
+        # Process up to 2 unknown names per text to avoid rate limits (reduced from 5)
+        max_ai_guesses = int(os.environ.get("MAX_AI_TICKER_GUESSES", "2"))
+        
+        # Check if we've already hit rate limits
+        max_ai_calls_per_run = int(os.environ.get("MAX_AI_TICKER_CALLS_PER_RUN", "10"))
+        if _ai_ticker_call_count >= max_ai_calls_per_run:
+            logging.debug("Skipping AI ticker guesses - rate limit reached")
+        else:
+            for name in list(unknown_names)[:max_ai_guesses]:
+                # Double-check we haven't hit the limit
+                if _ai_ticker_call_count >= max_ai_calls_per_run:
+                    break
+                ticker = guess_ticker_with_ai(name)
+                if ticker:
+                    found_tickers.add(ticker)
+    
+    return found_tickers
+
 def extract_tickers_from_text(text: str) -> set:
     """
     Extract potential stock tickers from text.
-    Looks for patterns like $TICKER, TICKER, or common ticker formats.
-    Filters out common words that aren't tickers.
+    Very conservative approach: primarily extracts $TICKER format.
+    For standalone tickers, only extracts if they appear in specific finance patterns.
     """
     tickers = set()
     
-    # Pattern 1: $TICKER (e.g., $AAPL, $TSLA) - most reliable indicator
+    # Pattern 1: $TICKER (e.g., $AAPL, $TSLA) - MOST RELIABLE, always include these
+    # But filter out common words that aren't tickers
     dollar_tickers = re.findall(r'\$([A-Z]{1,5})\b', text.upper())
-    tickers.update(dollar_tickers)
     
-    # Pattern 2: TICKER in all caps (common in finance discussions)
-    # Look for 2-5 letter sequences that are all caps and standalone
-    caps_tickers = re.findall(r'\b([A-Z]{2,5})\b', text.upper())
-    
-    # Expanded list of common words that aren't tickers
-    common_words = {
-        # Common articles/prepositions
-        'THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'HER', 'WAS', 'ONE', 
-        'OUR', 'OUT', 'DAY', 'GET', 'HAS', 'HIM', 'HIS', 'HOW', 'ITS', 'MAY', 'NEW', 'NOW', 
-        'OLD', 'SEE', 'TWO', 'WHO', 'WAY', 'USE', 'SHE', 'PUT', 'END', 'DID', 'SET', 'OFF', 
-        'TRY', 'TOO', 'ANY', 'OWN', 'ASK', 'YES', 'LET', 'RUN', 'FAR', 'TOP',
-        # The problematic ones
-        'TO', 'IN', 'OF', 'ON', 'AT', 'BY', 'AS', 'IS', 'IT', 'BE', 'DO', 'OR', 'IF', 'UP',
-        # Finance terms that aren't tickers
-        'BUY', 'SELL', 'HOLD', 'ETF', 'SPY', 'QQQ', 'DIA', 'VIX', 'SPX', 'DJI', 'USD', 'EUR',
-        # Other common words
-        'VIA', 'DUE', 'PAY', 'TAX', 'FEE', 'NET', 'GAP', 'IPO', 'EPS', 'PE', 'ROI', 'YTD',
-        'CEO', 'CFO', 'SEC', 'FED', 'IRS', 'GDP', 'CPI', 'PMI'
+    # Filter out common words that appear after $ but aren't tickers
+    invalid_dollar_words = {
+        'SPACE', 'RE', 'GROQ', 'DEALS', 'STORY', 'TERM', 'IM', 'RSUS', 'HALF', 'LAST',
+        'UNTIL', 'BASED', 'COUNT', 'MEDS', 'FRONT', 'COSTS', 'LINKS', 'TITLE', 'PDF', 'SORT',
+        'CASE', 'THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'WAS', 'ONE',
+        'OUR', 'OUT', 'DAY', 'GET', 'HAS', 'ITS', 'MAY', 'NEW', 'NOW', 'OLD', 'SEE', 'TWO',
+        'WHO', 'WAY', 'USE', 'PUT', 'END', 'DID', 'SET', 'OFF', 'TRY', 'TOO', 'ANY', 'OWN',
+        'ASK', 'YES', 'LET', 'RUN', 'FAR', 'TOP', 'TO', 'IN', 'OF', 'ON', 'AT', 'BY', 'AS',
+        'IS', 'IT', 'BE', 'DO', 'OR', 'IF', 'UP', 'WE', 'NO', 'MY', 'ME', 'AN', 'AM', 'SO',
+        'GO', 'US', 'HIM', 'HER', 'SHE', 'HIS', 'HOW', 'WHY', 'WHEN', 'WHAT', 'WHERE', 'THAT',
+        'THIS', 'THEY', 'THEM', 'THESE', 'THOSE', 'HAVE', 'HAD', 'WILL', 'WERE', 'SAID', 'EACH',
+        'TIME', 'MORE', 'VERY', 'JUST', 'FIRST', 'ALSO', 'AFTER', 'BACK', 'OTHER', 'MANY', 'THEN',
+        'WOULD', 'MAKE', 'LIKE', 'INTO', 'LOOK', 'KNOW', 'FROM', 'WITH', 'OVER', 'MOST', 'MIGHT',
+        'BEEN', 'BEING', 'ONLY', 'EVEN', 'RIGHT', 'LEFT', 'DOWN', 'TAKE', 'GIVE', 'MADE', 'COME',
+        'WENT', 'SAW', 'GOT', 'TOLD', 'ASKED', 'THINK', 'FEEL', 'SEEM', 'KEEP', 'MOVE', 'TURN',
+        'SHOW', 'HEAR', 'PLAY', 'LIVE', 'WORK', 'CALL', 'TELL', 'NEED', 'WANT', 'FIND', 'HELP',
+        'LEAVE', 'MEAN', 'BEGIN', 'BRING', 'HAPPEN', 'WRITE', 'SIT', 'STAND', 'LOSE', 'PAY',
+        'MEET', 'INCLUDE', 'CONTINUE', 'LEARN', 'CHANGE', 'LEAD', 'UNDERSTAND', 'WATCH', 'FOLLOW',
+        'STOP', 'CREATE', 'SPEAK', 'READ', 'ALLOW', 'ADD', 'SPEND', 'GROW', 'OPEN', 'WALK', 'WIN',
+        'OFFER', 'REMEMBER', 'LOVE', 'CONSIDER', 'APPEAR', 'BUY', 'SELL', 'HOLD', 'ETF', 'SPY',
+        'QQQ', 'DIA', 'VIX', 'SPX', 'DJI', 'USD', 'EUR', 'VIA', 'DUE', 'TAX', 'FEE', 'NET', 'GAP',
+        'IPO', 'EPS', 'PE', 'ROI', 'YTD', 'CEO', 'CFO', 'SEC', 'FED', 'IRS', 'GDP', 'CPI', 'PMI',
+        'API', 'URL', 'HTTP', 'HTTPS', 'EST', 'ETC', 'AWS', 'LLM', 'NYSE', 'NAS', 'AMEX', 'DATA',
+        'THIN', 'DR', 'VALVE', 'PAUSE', 'ISSUE', 'FINES', 'TODAY', 'LEVEL', 'YEARS', 'LATER',
+        'PRESS', 'CYCLE', 'LEAVE', 'EXIST', 'KOREA', 'HABIT', 'LARGE', 'SHARE', 'STOCK', 'SCALE',
+        'MEDIA', 'LOCAL', 'STATE', 'PRICE', 'BAD', 'DENSE', 'AWARE', 'ANGER', 'OWNED', 'WEEKS',
+        'BIG', 'PUTS', 'SWORN', 'USERS', 'GOING', 'BLOW', 'LIFE', 'KNEW', 'GLORY', 'CHUNK', 'TIED',
+        'GUESS', 'EXIT', 'BETS', 'VALUE', 'FULL', 'VIEW', 'MOVES', 'CLICK', 'TRAP', 'RACK', 'EVERY',
+        'ASICS', 'BASE', 'CITI', 'ARGUE', 'ZERO', 'CHIP', 'SUM', 'DREW', 'WORTH', 'ADDED', 'KEPT',
+        'HAND', 'LESS', 'SHUTS', 'PHASE', 'XPUS', 'INP', 'VE', 'WHILE', 'THING', 'LOWER', 'LOL',
+        'MUCH', 'IDIOT', 'MONEY', 'HELL', 'CATCH', 'JAN', 'CHIPS', 'YAHOO', 'HTML', 'NEWS',
+        'PENNY', 'NAME', 'RISK', 'DONE', 'TIRED', 'CHINA', 'READY', 'PNG', 'MULTI', 'AUTO', 'LONG',
+        'BRAIN', 'WIDTH', 'MISS', 'WEBP', 'REDD', 'SOLD', 'LEAPS', 'LOSS', 'TRULY', 'SPAN', 'BTW',
+        'MONTH', 'NEVER', 'TWICE', 'WISH', 'BIRTH', 'LOST', 'ENDED', 'PUNCH', 'ABLE', 'MALE', 'TRUST',
+        'HASN', 'YET', 'LOGIC', 'STILL', 'BEGAN', 'FINAL', 'POSTS', 'SINCE', 'ABOUT', 'NON', 'SOON',
+        'FUNNY', 'PORN', 'WENDY', 'RUIN', 'FEELS', 'GONNA', 'COULD', 'THERE', 'POINT', 'YOUR', 'HURTS',
+        'WORLD', 'TOOK', 'TRADE', 'THEIR', 'LAID', 'DAILY', 'CALLS', 'LOYAL', 'HOT', 'STAY', 'GONE',
+        'DOESN', 'GOES', 'HEART', 'TEXTS', 'GIRL', 'TAKES', 'FELT'
     }
     
-    # Only include caps tickers that aren't common words
-    filtered_tickers = [t for t in caps_tickers if t not in common_words and len(t) >= 2]
-    tickers.update(filtered_tickers)
+    # Filter out invalid words
+    valid_dollar_tickers = [t for t in dollar_tickers if t not in invalid_dollar_words]
+    tickers.update(valid_dollar_tickers)
+    
+    # Pattern 2: Standalone tickers - ONLY extract if they appear in very specific patterns
+    # This is much more conservative to avoid false positives
+    
+    text_upper = text.upper()
+    
+    # Comprehensive list of common words to exclude (expanded significantly)
+    common_words = {
+        # Basic words
+        'THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'WAS', 'ONE', 
+        'OUR', 'OUT', 'DAY', 'GET', 'HAS', 'ITS', 'MAY', 'NEW', 'NOW', 'OLD', 'SEE', 
+        'TWO', 'WHO', 'WAY', 'USE', 'PUT', 'END', 'DID', 'SET', 'OFF', 'TRY', 'TOO', 
+        'ANY', 'OWN', 'ASK', 'YES', 'LET', 'RUN', 'FAR', 'TOP', 'TO', 'IN', 'OF', 
+        'ON', 'AT', 'BY', 'AS', 'IS', 'IT', 'BE', 'DO', 'OR', 'IF', 'UP', 'WE', 
+        'NO', 'MY', 'ME', 'AN', 'AM', 'SO', 'GO', 'US', 'HIM', 'HER', 'SHE', 'HIS',
+        'HOW', 'WHY', 'WHEN', 'WHAT', 'WHERE', 'THAT', 'THIS', 'THEY', 'THEM', 'THESE',
+        'THOSE', 'HAVE', 'HAD', 'WILL', 'WERE', 'SAID', 'EACH', 'TIME', 'MORE', 'VERY',
+        'JUST', 'FIRST', 'ALSO', 'AFTER', 'BACK', 'OTHER', 'MANY', 'THEN', 'WOULD',
+        'MAKE', 'LIKE', 'INTO', 'LOOK', 'KNOW', 'FROM', 'WITH', 'OVER', 'MOST', 'MIGHT',
+        'BEEN', 'BEING', 'ONLY', 'EVEN', 'RIGHT', 'LEFT', 'DOWN', 'TAKE', 'GIVE', 'MADE',
+        'COME', 'WENT', 'SAW', 'GOT', 'TOLD', 'ASKED', 'THINK', 'FEEL', 'SEEM', 'KEEP',
+        'MOVE', 'TURN', 'SHOW', 'HEAR', 'PLAY', 'LIVE', 'WORK', 'CALL', 'TELL', 'ASK',
+        'NEED', 'WANT', 'TRY', 'USE', 'FIND', 'GIVE', 'HELP', 'FEEL', 'SEEM', 'LEAVE',
+        'PUT', 'MEAN', 'KEEP', 'LET', 'BEGIN', 'HELP', 'SHOW', 'HEAR', 'PLAY', 'RUN',
+        'MOVE', 'LIKE', 'BELIEVE', 'BRING', 'HAPPEN', 'WRITE', 'SIT', 'STAND', 'LOSE',
+        'PAY', 'MEET', 'INCLUDE', 'CONTINUE', 'SET', 'LEARN', 'CHANGE', 'LEAD', 'UNDERSTAND',
+        'WATCH', 'FOLLOW', 'STOP', 'CREATE', 'SPEAK', 'READ', 'ALLOW', 'ADD', 'SPEND',
+        'GROW', 'OPEN', 'WALK', 'WIN', 'OFFER', 'REMEMBER', 'LOVE', 'CONSIDER', 'APPEAR',
+        # Finance terms that aren't tickers
+        'BUY', 'SELL', 'HOLD', 'ETF', 'SPY', 'QQQ', 'DIA', 'VIX', 'SPX', 'DJI', 'USD', 'EUR',
+        'VIA', 'DUE', 'TAX', 'FEE', 'NET', 'GAP', 'IPO', 'EPS', 'PE', 'ROI', 'YTD',
+        'CEO', 'CFO', 'SEC', 'FED', 'IRS', 'GDP', 'CPI', 'PMI', 'API', 'URL', 'HTTP', 'HTTPS',
+        'EST', 'ETC', 'AWS', 'LLM', 'NYSE', 'NAS', 'AMEX', 'DATA', 'THIN', 'DR', 'VALVE',
+        'PAUSE', 'ISSUE', 'FINES', 'TODAY', 'LEVEL', 'YEARS', 'LATER', 'PRESS', 'CYCLE',
+        'LEAVE', 'EXIST', 'KOREA', 'HABIT', 'LARGE', 'SHARE', 'STOCK', 'SCALE', 'MEDIA',
+        'LOCAL', 'STATE', 'PRICE', 'BAD', 'DENSE', 'AWARE', 'ANGER', 'OWNED', 'WEEKS',
+        'BIG', 'PUTS', 'SWORN', 'USERS', 'GOING', 'BLOW', 'LIFE', 'KNEW', 'GLORY',
+        'CHUNK', 'TIED', 'GUESS', 'EXIT', 'BETS', 'VALUE', 'FULL', 'VIEW', 'MOVES',
+        'CLICK', 'TRAP', 'RACK', 'EVERY', 'ASICS', 'BASE', 'CITI', 'ARGUE', 'ZERO',
+        'CHIP', 'SUM', 'DREW', 'WORTH', 'ADDED', 'KEPT', 'HAND', 'LESS', 'SHUTS',
+        'PHASE', 'XPUS', 'INP', 'VE',
+        # Additional common words from errors
+        'WHILE', 'THING', 'LOWER', 'LOL', 'MUCH', 'IDIOT', 'MONEY', 'HELL', 'CATCH', 'JAN',
+        'CHIPS', 'YAHOO', 'HTML', 'NEWS', 'PENNY', 'NAME', 'RISK', 'DONE', 'TIRED', 'CHINA',
+        'READY', 'PNG', 'MULTI', 'AUTO', 'LONG', 'BRAIN', 'WIDTH', 'MISS', 'WEBP', 'REDD',
+        'SOLD', 'LEAPS', 'LOSS', 'TRULY', 'SPAN', 'BTW', 'MONTH', 'NEVER', 'TWICE', 'WISH',
+        'BIRTH', 'LOST', 'ENDED', 'PUNCH', 'ABLE', 'MALE', 'TRUST', 'HASN', 'YET', 'LOGIC',
+        'STILL', 'BEGAN', 'FINAL', 'POSTS', 'SINCE', 'ABOUT', 'NON', 'SOON', 'FUNNY', 'PORN',
+        'WENDY', 'RUIN', 'FEELS', 'GONNA', 'COULD', 'THERE', 'POINT', 'YOUR', 'HURTS', 'WORLD',
+        'TOOK', 'TRADE', 'THEIR', 'LAID', 'DAILY', 'CALLS', 'LOYAL', 'HOT', 'STAY', 'GONE',
+        'DOESN', 'GOES', 'HEART', 'TEXTS', 'GIRL', 'TAKES', 'FELT', 'WHILE', 'THING', 'LOWER'
+    }
+    
+    # Only extract standalone tickers if they appear in very specific patterns
+    # Pattern: "buy TICKER", "TICKER buy", "sell TICKER", "TICKER stock", "TICKER shares", etc.
+    
+    # Pattern 1: "buy AAPL", "sell TSLA", etc. - ticker is second element
+    pattern1_matches = re.findall(r'\b(BUY|SELL|HOLD|TRADE|INVEST|SHORT|LONG)\s+([A-Z]{2,5})\b', text_upper)
+    for match in pattern1_matches:
+        potential_ticker = match[1]  # ticker is second element
+        if potential_ticker not in common_words and 2 <= len(potential_ticker) <= 5:
+            tickers.add(potential_ticker)
+    
+    # Pattern 2: "AAPL stock", "TSLA shares", etc. - ticker is first element
+    pattern2_matches = re.findall(r'\b([A-Z]{2,5})\s+(STOCK|STOCKS|SHARE|SHARES|TICKER|SYMBOL|EQUITY|EQUITIES)\b', text_upper)
+    for match in pattern2_matches:
+        potential_ticker = match[0]  # ticker is first element
+        if potential_ticker not in common_words and 2 <= len(potential_ticker) <= 5:
+            tickers.add(potential_ticker)
+    
+    # Pattern 3: "stock AAPL", "shares TSLA", etc. - ticker is second element
+    pattern3_matches = re.findall(r'\b(STOCK|STOCKS|SHARE|SHARES|TICKER|SYMBOL)\s+([A-Z]{2,5})\b', text_upper)
+    for match in pattern3_matches:
+        potential_ticker = match[1]  # ticker is second element
+        if potential_ticker not in common_words and 2 <= len(potential_ticker) <= 5:
+            tickers.add(potential_ticker)
+    
+    # Pattern 4: "AAPL is up", "TSLA was down", etc. - ticker is first element
+    pattern4_matches = re.findall(r'\b([A-Z]{2,5})\s+(IS|WAS|ARE|WERE|HAS|HAVE|WILL|WOULD|SHOULD|COULD)\s+(UP|DOWN|HIGH|LOW|GOOD|BAD|BULL|BEAR)', text_upper)
+    for match in pattern4_matches:
+        potential_ticker = match[0]  # ticker is first element
+        if potential_ticker not in common_words and 2 <= len(potential_ticker) <= 5:
+            tickers.add(potential_ticker)
+    
+    # Also check for words that appear multiple times (likely real tickers)
+    # Count occurrences of 2-5 letter all-caps words
+    all_caps_words = re.findall(r'\b([A-Z]{2,5})\b', text_upper)
+    word_counts = {}
+    for word in all_caps_words:
+        if word not in common_words and 2 <= len(word) <= 5:
+            word_counts[word] = word_counts.get(word, 0) + 1
+    
+    # If a word appears 3+ times, it's likely a real ticker
+    for word, count in word_counts.items():
+        if count >= 3:
+            tickers.add(word)
+    
+    # Pattern 5: Extract company names and map them to tickers
+    # This catches mentions like "Apple", "Tesla", "Microsoft" etc.
+    company_tickers = extract_company_names_from_text(text)
+    tickers.update(company_tickers)
     
     return tickers
 
@@ -926,6 +1576,9 @@ def main():
     
     All APIs are properly integrated into both LLM prompts.
     """
+    # Reset AI ticker call counter at start of each run
+    reset_ai_ticker_call_count()
+    
     # Pull a few market proxies
     spx = stooq_last_two_closes("^spx")  # S&P 500
     # VIX sometimes fails on Stooq; handle errors gracefully
@@ -1022,9 +1675,59 @@ Headlines:
     # ---------- Fetch yfinance context ----------
     # ✅ Yahoo Finance API: Fetch data for LLM-suggested tickers (included in Pass 2 prompt)
     # Filter out invalid tickers first to avoid noisy errors
+    # Pre-filter: Skip obviously invalid tickers (common words) before expensive validation
+    invalid_words = {
+        'SPACE', 'RE', 'GROQ', 'DEALS', 'STORY', 'TERM', 'IM', 'RSUS', 'HALF', 'LAST',
+        'UNTIL', 'BASED', 'COUNT', 'MEDS', 'FRONT', 'COSTS', 'LINKS', 'TITLE', 'PDF', 'SORT',
+        'CASE', 'THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'WAS', 'ONE',
+        'OUR', 'OUT', 'DAY', 'GET', 'HAS', 'ITS', 'MAY', 'NEW', 'NOW', 'OLD', 'SEE', 'TWO',
+        'WHO', 'WAY', 'USE', 'PUT', 'END', 'DID', 'SET', 'OFF', 'TRY', 'TOO', 'ANY', 'OWN',
+        'ASK', 'YES', 'LET', 'RUN', 'FAR', 'TOP', 'TO', 'IN', 'OF', 'ON', 'AT', 'BY', 'AS',
+        'IS', 'IT', 'BE', 'DO', 'OR', 'IF', 'UP', 'WE', 'NO', 'MY', 'ME', 'AN', 'AM', 'SO',
+        'GO', 'US', 'HIM', 'HER', 'SHE', 'HIS', 'HOW', 'WHY', 'WHEN', 'WHAT', 'WHERE', 'THAT',
+        'THIS', 'THEY', 'THEM', 'THESE', 'THOSE', 'HAVE', 'HAD', 'WILL', 'WERE', 'SAID', 'EACH',
+        'TIME', 'MORE', 'VERY', 'JUST', 'FIRST', 'ALSO', 'AFTER', 'BACK', 'OTHER', 'MANY', 'THEN',
+        'WOULD', 'MAKE', 'LIKE', 'INTO', 'LOOK', 'KNOW', 'FROM', 'WITH', 'OVER', 'MOST', 'MIGHT',
+        'BEEN', 'BEING', 'ONLY', 'EVEN', 'RIGHT', 'LEFT', 'DOWN', 'TAKE', 'GIVE', 'MADE', 'COME',
+        'WENT', 'SAW', 'GOT', 'TOLD', 'ASKED', 'THINK', 'FEEL', 'SEEM', 'KEEP', 'MOVE', 'TURN',
+        'SHOW', 'HEAR', 'PLAY', 'LIVE', 'WORK', 'CALL', 'TELL', 'NEED', 'WANT', 'FIND', 'HELP',
+        'LEAVE', 'MEAN', 'BEGIN', 'BRING', 'HAPPEN', 'WRITE', 'SIT', 'STAND', 'LOSE', 'PAY',
+        'MEET', 'INCLUDE', 'CONTINUE', 'LEARN', 'CHANGE', 'LEAD', 'UNDERSTAND', 'WATCH', 'FOLLOW',
+        'STOP', 'CREATE', 'SPEAK', 'READ', 'ALLOW', 'ADD', 'SPEND', 'GROW', 'OPEN', 'WALK', 'WIN',
+        'OFFER', 'REMEMBER', 'LOVE', 'CONSIDER', 'APPEAR', 'BUY', 'SELL', 'HOLD', 'ETF', 'SPY',
+        'QQQ', 'DIA', 'VIX', 'SPX', 'DJI', 'USD', 'EUR', 'VIA', 'DUE', 'TAX', 'FEE', 'NET', 'GAP',
+        'IPO', 'EPS', 'PE', 'ROI', 'YTD', 'CEO', 'CFO', 'SEC', 'FED', 'IRS', 'GDP', 'CPI', 'PMI',
+        'API', 'URL', 'HTTP', 'HTTPS', 'EST', 'ETC', 'AWS', 'LLM', 'NYSE', 'NAS', 'AMEX', 'DATA',
+        'THIN', 'DR', 'VALVE', 'PAUSE', 'ISSUE', 'FINES', 'TODAY', 'LEVEL', 'YEARS', 'LATER',
+        'PRESS', 'CYCLE', 'LEAVE', 'EXIST', 'KOREA', 'HABIT', 'LARGE', 'SHARE', 'STOCK', 'SCALE',
+        'MEDIA', 'LOCAL', 'STATE', 'PRICE', 'BAD', 'DENSE', 'AWARE', 'ANGER', 'OWNED', 'WEEKS',
+        'BIG', 'PUTS', 'SWORN', 'USERS', 'GOING', 'BLOW', 'LIFE', 'KNEW', 'GLORY', 'CHUNK', 'TIED',
+        'GUESS', 'EXIT', 'BETS', 'VALUE', 'FULL', 'VIEW', 'MOVES', 'CLICK', 'TRAP', 'RACK', 'EVERY',
+        'ASICS', 'BASE', 'CITI', 'ARGUE', 'ZERO', 'CHIP', 'SUM', 'DREW', 'WORTH', 'ADDED', 'KEPT',
+        'HAND', 'LESS', 'SHUTS', 'PHASE', 'XPUS', 'INP', 'VE', 'WHILE', 'THING', 'LOWER', 'LOL',
+        'MUCH', 'IDIOT', 'MONEY', 'HELL', 'CATCH', 'JAN', 'CHIPS', 'YAHOO', 'HTML', 'NEWS',
+        'PENNY', 'NAME', 'RISK', 'DONE', 'TIRED', 'CHINA', 'READY', 'PNG', 'MULTI', 'AUTO', 'LONG',
+        'BRAIN', 'WIDTH', 'MISS', 'WEBP', 'REDD', 'SOLD', 'LEAPS', 'LOSS', 'TRULY', 'SPAN', 'BTW',
+        'MONTH', 'NEVER', 'TWICE', 'WISH', 'BIRTH', 'LOST', 'ENDED', 'PUNCH', 'ABLE', 'MALE', 'TRUST',
+        'HASN', 'YET', 'LOGIC', 'STILL', 'BEGAN', 'FINAL', 'POSTS', 'SINCE', 'ABOUT', 'NON', 'SOON',
+        'FUNNY', 'PORN', 'WENDY', 'RUIN', 'FEELS', 'GONNA', 'COULD', 'THERE', 'POINT', 'YOUR', 'HURTS',
+        'WORLD', 'TOOK', 'TRADE', 'THEIR', 'LAID', 'DAILY', 'CALLS', 'LOYAL', 'HOT', 'STAY', 'GONE',
+        'DOESN', 'GOES', 'HEART', 'TEXTS', 'GIRL', 'TAKES', 'FELT'
+    }
+    
     valid_tickers = []
     invalid_tickers = []
+    
+    # Load failed tickers cache once
+    failed_tickers = load_failed_tickers()
+    
     for tk in tickers:
+        tk_upper = tk.upper().strip()
+        # Pre-filter: Skip obviously invalid words and previously failed tickers
+        if tk_upper in invalid_words or len(tk_upper) < 2 or tk_upper in failed_tickers:
+            invalid_tickers.append(tk)
+            continue
+        # Now validate with yfinance
         if is_valid_ticker(tk):
             valid_tickers.append(tk)
         else:
