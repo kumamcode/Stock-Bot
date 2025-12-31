@@ -11,9 +11,11 @@ import logging
 import smtplib
 import yfinance as yf
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from dotenv import load_dotenv
 import warnings
+import subprocess
 
 # Suppress yfinance warnings and urllib3 warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -29,26 +31,63 @@ logging.basicConfig(
 
 load_dotenv()  # loads .env into os.environ
 
-# ---------- LLM (local via Ollama) ----------
-# API STATUS: ✅ WORKING (requires Ollama running on localhost:11434)
-# Default model can be overridden via OLLAMA_MODEL env variable
-DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
+# ---------- LLM (Cloud via Groq) ----------
+# API STATUS: ✅ WORKING (free tier available, requires GROQ_API_KEY in .env)
+# Default model can be overridden via GROQ_MODEL env variable
+# Available models: llama-3.3-70b-versatile, llama-3.1-70b-instant, llama-3.1-8b-instant, mixtral-8x7b-32768
+DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
+# Groq API - No local setup needed!
 def ask_llm(prompt: str, model: str = None) -> str:
     """
-    Calls local Ollama LLM API.
-    API: http://localhost:11434/api/generate
-    Status: ✅ WORKING (requires Ollama service running)
+    Calls Groq cloud LLM API (free tier available).
+    Much faster and more powerful than local models.
+    No local setup needed - runs entirely in the cloud!
     """
     if model is None:
         model = DEFAULT_MODEL
-    r = requests.post(
-        "http://localhost:11434/api/generate",
-        json={"model": model, "prompt": prompt, "stream": False},
-        timeout=180,
-    )
-    r.raise_for_status()
-    return r.json()["response"].strip()
+    
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GROQ_API_KEY not set in .env file. "
+            "Get a free API key at https://console.groq.com"
+        )
+    
+    try:
+        from groq import Groq
+        client = Groq(api_key=api_key)
+        
+        logging.info(f"Calling Groq API with model: {model}")
+        logging.info(f"Prompt length: {len(prompt)} characters")
+        
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+        )
+        
+        result = response.choices[0].message.content.strip()
+        logging.info(f"Received response (length: {len(result)} characters)")
+        return result
+        
+    except ImportError:
+        # Fallback to requests if groq library not installed
+        logging.warning("groq library not installed, using requests fallback")
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+        }
+        
+        response = requests.post(url, json=data, headers=headers, timeout=60)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"].strip()
 
 # ---------- Data (simple, free sources) ----------
 def fetch_headlines():
@@ -297,32 +336,39 @@ def format_snapshots(snaps: list[dict]) -> str:
     return "\n".join(lines)
 
 def sanitize_and_extract_ticker(raw: str) -> str | None:
-    """Sanitize LLM token and try to extract a plausible short ticker.
-    Returns None if the token looks invalid and should be skipped.
+    """
+    Only accept things that look like real ticker symbols.
+    If it's a company name (e.g., NVIDIA), try to resolve via Yahoo search.
     """
     if not raw or not isinstance(raw, str):
         return None
-    tt = raw.strip().upper()
-    tt = tt.lstrip("$")
-    # keep only letters, numbers, dot, dash
-    tt = re.sub(r"[^A-Z0-9\.\-]", "", tt)
-    # If short enough, accept
-    if 1 <= len(tt) <= 7:
-        return tt
 
-    # Try to extract trailing short ticker (1-5 letters/digits, optionally . or - parts)
-    m = re.search(r"([A-Z0-9]{1,5}(?:[\.\-][A-Z0-9]{1,4})?)$", tt)
-    if m:
-        cand = m.group(1)
-        if 1 <= len(cand) <= 7:
-            return cand
-    # As a last resort, query Yahoo Finance search endpoint to resolve fuzzy names
+    s = raw.strip().upper()
+
+    # Strip leading $ and punctuation
+    s = s.lstrip("$")
+    s = re.sub(r"[^A-Z0-9\.\-]", "", s)
+
+    # Reject empty
+    if not s:
+        return None
+
+    # Heuristic: Real US tickers are usually 1–5 chars (sometimes 6, rarely 7).
+    # BUT words like NVIDIA/MICRO will slip in. So we only accept as "direct tickers"
+    # if it matches a ticker-like pattern AND is not a long word.
+    direct_ok = re.fullmatch(r"[A-Z]{1,5}([.\-][A-Z0-9]{1,2})?", s) is not None
+
+    if direct_ok:
+        return s
+
+    # If it doesn't look like a ticker symbol, try resolving via Yahoo search
     resolved = resolve_ticker_via_yahoo(raw)
     if resolved:
         return resolved
 
-    logging.info("Skipping improbable ticker token: %s", raw)
+    logging.info("Skipping invalid ticker token: %s", raw)
     return None
+
 
 def resolve_ticker_via_yahoo(query: str) -> str | None:
     """
@@ -390,12 +436,162 @@ def resolve_ticker_via_yahoo(query: str) -> str | None:
         cache[query] = None
         return None
 # ---------- Email ----------
+def markdown_to_html(text: str) -> str:
+    """
+    Convert markdown-style text to HTML for email formatting.
+    Converts # headers, * bullet points, + sub-bullets, **bold**, numbered lists, etc. to proper HTML.
+    """
+    lines = text.split('\n')
+    result_lines = []
+    in_ul = False
+    in_ol = False
+    in_sub_ul = False  # Track nested sub-bullets
+    
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Check for leading spaces to detect indentation level
+        leading_spaces = len(line) - len(line.lstrip())
+        
+        # Skip empty lines (will add spacing later)
+        if not stripped:
+            if in_sub_ul:
+                result_lines.append('</ul>')
+                in_sub_ul = False
+            if in_ul:
+                result_lines.append('</ul>')
+                in_ul = False
+            if in_ol:
+                result_lines.append('</ol>')
+                in_ol = False
+            result_lines.append('<br>')
+            continue
+        
+        # Headers
+        if stripped.startswith('###'):
+            if in_sub_ul:
+                result_lines.append('</ul>')
+                in_sub_ul = False
+            if in_ul:
+                result_lines.append('</ul>')
+                in_ul = False
+            if in_ol:
+                result_lines.append('</ol>')
+                in_ol = False
+            result_lines.append(f'<h3>{stripped[3:].strip()}</h3>')
+        elif stripped.startswith('##'):
+            if in_sub_ul:
+                result_lines.append('</ul>')
+                in_sub_ul = False
+            if in_ul:
+                result_lines.append('</ul>')
+                in_ul = False
+            if in_ol:
+                result_lines.append('</ol>')
+                in_ol = False
+            result_lines.append(f'<h2>{stripped[2:].strip()}</h2>')
+        elif stripped.startswith('#'):
+            if in_sub_ul:
+                result_lines.append('</ul>')
+                in_sub_ul = False
+            if in_ul:
+                result_lines.append('</ul>')
+                in_ul = False
+            if in_ol:
+                result_lines.append('</ol>')
+                in_ol = False
+            result_lines.append(f'<h2>{stripped[1:].strip()}</h2>')
+        # Sub-bullet points (+ or indented bullets)
+        elif stripped.startswith('+') or (leading_spaces > 2 and re.match(r'^[\*\-\•\+]\s+', stripped)):
+            # Close numbered lists if open
+            if in_ol:
+                result_lines.append('</ol>')
+                in_ol = False
+            # If we're not in a main list, start one (treat as main bullet)
+            if not in_ul:
+                result_lines.append('<ul>')
+                in_ul = True
+                in_sub_ul = False
+            # If we're in a main list but not in a sub-list, start nested list
+            elif in_ul and not in_sub_ul:
+                # Check if last item was a main bullet - nest the sub-bullet under it
+                if result_lines and result_lines[-1].endswith('</li>'):
+                    # Remove the closing </li> and start nested list
+                    result_lines[-1] = result_lines[-1].replace('</li>', '')
+                    result_lines.append('<ul>')
+                    in_sub_ul = True
+                else:
+                    # Start a new nested list
+                    result_lines.append('<ul>')
+                    in_sub_ul = True
+            # Remove the + or bullet and formatting
+            content = re.sub(r'^[\+\*\-\•]\s+', '', stripped)
+            result_lines.append(f'<li>{content}</li>')
+        # Numbered lists (1) or 1. format
+        elif re.match(r'^\d+[\)\.]\s+', stripped):
+            if in_sub_ul:
+                result_lines.append('</ul>')
+                in_sub_ul = False
+            if in_ul:
+                result_lines.append('</ul>')
+                in_ul = False
+            if not in_ol:
+                result_lines.append('<ol>')
+                in_ol = True
+            # Remove the number and formatting
+            content = re.sub(r'^\d+[\)\.]\s+', '', stripped)
+            result_lines.append(f'<li>{content}</li>')
+        # Main bullet points (*, -, •) - but not if it's indented (that's a sub-bullet)
+        elif re.match(r'^[\*\-\•]\s+', stripped) and leading_spaces == 0:
+            if in_sub_ul:
+                result_lines.append('</ul>')
+                in_sub_ul = False
+            if in_ol:
+                result_lines.append('</ol>')
+                in_ol = False
+            if not in_ul:
+                result_lines.append('<ul>')
+                in_ul = True
+            # Remove the bullet and formatting
+            content = re.sub(r'^[\*\-\•]\s+', '', stripped)
+            result_lines.append(f'<li>{content}</li>')
+        # Regular paragraph
+        else:
+            if in_sub_ul:
+                result_lines.append('</ul>')
+                in_sub_ul = False
+            if in_ul:
+                result_lines.append('</ul>')
+                in_ul = False
+            if in_ol:
+                result_lines.append('</ol>')
+                in_ol = False
+            result_lines.append(f'<p>{stripped}</p>')
+    
+    # Close any open lists
+    if in_sub_ul:
+        result_lines.append('</ul>')
+    if in_ul:
+        result_lines.append('</ul>')
+    if in_ol:
+        result_lines.append('</ol>')
+    
+    html = '\n'.join(result_lines)
+    
+    # Convert bold (**text** -> <strong>text</strong>)
+    html = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', html)
+    
+    # Convert italic (_text_ -> <em>text</em>)
+    html = re.sub(r'_(.*?)_', r'<em>\1</em>', html)
+    
+    return html
+
 def send_email(subject: str, body: str):
     """
-    Sends email via Gmail SMTP.
+    Sends email via Gmail SMTP with HTML formatting.
     API: smtp.gmail.com:465 (SMTP_SSL)
     Status: ✅ WORKING (requires GMAIL_USER and GMAIL_APP_PASSWORD in .env)
     Supports TO, CC, and BCC recipients (comma-separated in env vars).
+    Converts markdown-style formatting to HTML for proper rendering in Gmail.
     """
     gmail_user = os.environ.get("GMAIL_USER")
     gmail_app_password = os.environ.get("GMAIL_APP_PASSWORD")
@@ -411,12 +607,74 @@ def send_email(subject: str, body: str):
     if not to_emails:
         raise RuntimeError("No recipient found. Set TO_EMAIL in environment (comma-separated for multiple).")
 
-    msg = MIMEText(body, "plain", "utf-8")
+    # Convert markdown to HTML
+    html_body = markdown_to_html(body)
+    
+    # Create HTML email with proper styling
+    html_email = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                line-height: 1.6;
+                color: #333;
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 20px;
+            }}
+            h2 {{
+                color: #2c3e50;
+                border-bottom: 2px solid #3498db;
+                padding-bottom: 5px;
+                margin-top: 20px;
+            }}
+            h3 {{
+                color: #34495e;
+                margin-top: 15px;
+            }}
+            ul, ol {{
+                margin: 10px 0;
+                padding-left: 30px;
+            }}
+            ul ul {{
+                margin: 5px 0;
+                padding-left: 25px;
+                list-style-type: circle;
+            }}
+            li {{
+                margin: 5px 0;
+            }}
+            p {{
+                margin: 10px 0;
+            }}
+            strong {{
+                color: #2c3e50;
+            }}
+        </style>
+    </head>
+    <body>
+        {html_body}
+    </body>
+    </html>
+    """
+
+    # Create multipart message (HTML with plain text fallback)
+    msg = MIMEMultipart('alternative')
     msg["Subject"] = subject
     msg["From"] = gmail_user
     msg["To"] = ", ".join(to_emails)
     if cc_emails:
         msg["Cc"] = ", ".join(cc_emails)
+
+    # Add both plain text and HTML versions
+    part1 = MIMEText(body, "plain", "utf-8")
+    part2 = MIMEText(html_email, "html", "utf-8")
+    
+    msg.attach(part1)
+    msg.attach(part2)
 
     # Actual delivery list includes To + Cc + Bcc
     all_recipients = to_emails + cc_emails + bcc_emails
@@ -425,18 +683,58 @@ def send_email(subject: str, body: str):
         server.login(gmail_user, gmail_app_password)
         server.sendmail(gmail_user, all_recipients, msg.as_string())
 
+def extract_tickers_from_text(text: str) -> set:
+    """
+    Extract potential stock tickers from text.
+    Looks for patterns like $TICKER, TICKER, or common ticker formats.
+    Filters out common words that aren't tickers.
+    """
+    tickers = set()
+    
+    # Pattern 1: $TICKER (e.g., $AAPL, $TSLA) - most reliable indicator
+    dollar_tickers = re.findall(r'\$([A-Z]{1,5})\b', text.upper())
+    tickers.update(dollar_tickers)
+    
+    # Pattern 2: TICKER in all caps (common in finance discussions)
+    # Look for 2-5 letter sequences that are all caps and standalone
+    caps_tickers = re.findall(r'\b([A-Z]{2,5})\b', text.upper())
+    
+    # Expanded list of common words that aren't tickers
+    common_words = {
+        # Common articles/prepositions
+        'THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'HER', 'WAS', 'ONE', 
+        'OUR', 'OUT', 'DAY', 'GET', 'HAS', 'HIM', 'HIS', 'HOW', 'ITS', 'MAY', 'NEW', 'NOW', 
+        'OLD', 'SEE', 'TWO', 'WHO', 'WAY', 'USE', 'SHE', 'PUT', 'END', 'DID', 'SET', 'OFF', 
+        'TRY', 'TOO', 'ANY', 'OWN', 'ASK', 'YES', 'LET', 'RUN', 'FAR', 'TOP',
+        # The problematic ones
+        'TO', 'IN', 'OF', 'ON', 'AT', 'BY', 'AS', 'IS', 'IT', 'BE', 'DO', 'OR', 'IF', 'UP',
+        # Finance terms that aren't tickers
+        'BUY', 'SELL', 'HOLD', 'ETF', 'SPY', 'QQQ', 'DIA', 'VIX', 'SPX', 'DJI', 'USD', 'EUR',
+        # Other common words
+        'VIA', 'DUE', 'PAY', 'TAX', 'FEE', 'NET', 'GAP', 'IPO', 'EPS', 'PE', 'ROI', 'YTD',
+        'CEO', 'CFO', 'SEC', 'FED', 'IRS', 'GDP', 'CPI', 'PMI'
+    }
+    
+    # Only include caps tickers that aren't common words
+    filtered_tickers = [t for t in caps_tickers if t not in common_words and len(t) >= 2]
+    tickers.update(filtered_tickers)
+    
+    return tickers
+
 def fetch_reddit_sentiment(subreddits: list, limit=50):
     """
     Fetches Reddit post sentiment from specified subreddits.
+    Also extracts and tracks stock tickers mentioned in posts.
     API: https://www.reddit.com/r/{subreddit}/hot.json (primary, free, no auth)
     Fallback: PRAW (Reddit API wrapper) if REDDIT_CLIENT_ID/SECRET provided
     Status: ✅ WORKING (public JSON API works without credentials)
     Uses VADER sentiment analysis to classify posts as positive/negative/neutral.
-    Returns: dict mapping subreddit names to sentiment metrics.
+    Returns: dict mapping subreddit names to sentiment metrics, and stock mentions.
     """
     # Try using Reddit's public JSON API first (no auth needed)
     analyzer = SentimentIntensityAnalyzer()
     results = {}
+    stock_mentions = {}  # Track ticker: {count, total_sentiment, positive_count, negative_count}
     user_agent = os.environ.get("REDDIT_USER_AGENT", "stock-bot/0.1 by /u/stockbot")
     
     for sub in subreddits:
@@ -468,6 +766,32 @@ def fetch_reddit_sentiment(subreddits: list, limit=50):
                     else:
                         neu += 1
                     cnt += 1
+                    
+                    # Extract tickers from this post
+                    tickers = extract_tickers_from_text(text)
+                    for ticker in tickers:
+                        ticker_clean = sanitize_and_extract_ticker(ticker)
+                        # Validate ticker exists before tracking it (filters out common words like TO, IN, OF)
+                        if ticker_clean and len(ticker_clean) >= 2 and is_valid_ticker(ticker_clean):
+                            if ticker_clean not in stock_mentions:
+                                stock_mentions[ticker_clean] = {
+                                    "count": 0,
+                                    "total_sentiment": 0.0,
+                                    "positive_count": 0,
+                                    "negative_count": 0,
+                                    "mentions": []
+                                }
+                            stock_mentions[ticker_clean]["count"] += 1
+                            stock_mentions[ticker_clean]["total_sentiment"] += score
+                            if score >= 0.05:
+                                stock_mentions[ticker_clean]["positive_count"] += 1
+                            elif score <= -0.05:
+                                stock_mentions[ticker_clean]["negative_count"] += 1
+                            stock_mentions[ticker_clean]["mentions"].append({
+                                "subreddit": sub,
+                                "sentiment": score,
+                                "title": title[:100]  # First 100 chars
+                            })
             
             if cnt:
                 results[sub] = {"pos": pos / cnt, "neg": neg / cnt, "neu": neu / cnt, "count": cnt}
@@ -497,6 +821,27 @@ def fetch_reddit_sentiment(subreddits: list, limit=50):
                         else:
                             neu += 1
                         cnt += 1
+                        
+                        # Extract tickers from this post
+                        tickers = extract_tickers_from_text(text)
+                        for ticker in tickers:
+                            ticker_clean = sanitize_and_extract_ticker(ticker)
+                            # Validate ticker exists before tracking it (filters out common words like TO, IN, OF)
+                            if ticker_clean and len(ticker_clean) >= 2 and is_valid_ticker(ticker_clean):
+                                if ticker_clean not in stock_mentions:
+                                    stock_mentions[ticker_clean] = {
+                                        "count": 0,
+                                        "total_sentiment": 0.0,
+                                        "positive_count": 0,
+                                        "negative_count": 0,
+                                        "mentions": []
+                                    }
+                                stock_mentions[ticker_clean]["count"] += 1
+                                stock_mentions[ticker_clean]["total_sentiment"] += score
+                                if score >= 0.05:
+                                    stock_mentions[ticker_clean]["positive_count"] += 1
+                                elif score <= -0.05:
+                                    stock_mentions[ticker_clean]["negative_count"] += 1
                     if cnt:
                         results[sub] = {"pos": pos / cnt, "neg": neg / cnt, "neu": neu / cnt, "count": cnt}
                     else:
@@ -506,7 +851,65 @@ def fetch_reddit_sentiment(subreddits: list, limit=50):
             else:
                 results[sub] = {"error": str(e)}
     
+    # Store stock mentions in results for later analysis
+    results["_stock_mentions"] = stock_mentions
     return results
+
+def get_top_reddit_stocks(reddit_sentiment: dict, top_n: int = 3) -> list:
+    """
+    Analyze Reddit stock mentions and return top N stocks by mention count and sentiment.
+    Returns list of dicts with ticker, mention_count, avg_sentiment, and positive_ratio.
+    """
+    stock_mentions = reddit_sentiment.get("_stock_mentions", {})
+    
+    if not stock_mentions:
+        return []
+    
+    # Calculate scores for each stock
+    scored_stocks = []
+    for ticker, data in stock_mentions.items():
+        if data["count"] < 2:  # Need at least 2 mentions to be significant
+            continue
+        
+        avg_sentiment = data["total_sentiment"] / data["count"]
+        positive_ratio = data["positive_count"] / data["count"] if data["count"] > 0 else 0
+        
+        # Score = mention_count * (1 + avg_sentiment) * positive_ratio
+        # This favors stocks with many mentions, positive sentiment, and high positive ratio
+        score = data["count"] * (1 + avg_sentiment) * (1 + positive_ratio)
+        
+        scored_stocks.append({
+            "ticker": ticker,
+            "mention_count": data["count"],
+            "avg_sentiment": avg_sentiment,
+            "positive_ratio": positive_ratio,
+            "positive_count": data["positive_count"],
+            "negative_count": data["negative_count"],
+            "score": score
+        })
+    
+    # Sort by score (highest first) and return top N
+    scored_stocks.sort(key=lambda x: x["score"], reverse=True)
+    return scored_stocks[:top_n]
+
+def format_top_reddit_stocks(top_stocks: list) -> str:
+    """
+    Format top Reddit stocks for inclusion in prompts.
+    """
+    if not top_stocks:
+        return "Top Reddit stocks: No significant stock mentions found in recent Reddit posts."
+    
+    lines = ["Top 3 stocks trending on Reddit (based on mention frequency and sentiment):"]
+    for i, stock in enumerate(top_stocks, 1):
+        sentiment_emoji = "📈" if stock["avg_sentiment"] > 0.1 else "📉" if stock["avg_sentiment"] < -0.1 else "➡️"
+        lines.append(
+            f"{i}. {stock['ticker']} {sentiment_emoji} - "
+            f"Mentioned {stock['mention_count']}x, "
+            f"avg sentiment: {stock['avg_sentiment']:+.2f}, "
+            f"{stock['positive_count']} positive / {stock['negative_count']} negative mentions"
+        )
+    
+    return "\n".join(lines)
 
 def main():
     """
@@ -516,9 +919,9 @@ def main():
     1. ✅ Stooq API: Fetch S&P 500 and VIX data
     2. ✅ Google News RSS: Fetch market headlines
     3. ✅ Reddit JSON API: Fetch sentiment from 9 finance subreddits
-    4. ✅ Ollama LLM: Generate ticker suggestions (Pass 1)
+    4. ✅ Groq Cloud LLM: Generate ticker suggestions (Pass 1)
     5. ✅ Yahoo Finance (yfinance): Fetch data for suggested tickers
-    6. ✅ Ollama LLM: Generate final investment memo (Pass 2)
+    6. ✅ Groq Cloud LLM: Generate final investment memo (Pass 2)
     7. ✅ Gmail SMTP: Email the memo
     
     All APIs are properly integrated into both LLM prompts.
@@ -543,6 +946,10 @@ def main():
     # Fetch Reddit sentiment from 9 finance subreddits (✅ WORKING - included in prompts)
     reddit_sentiment = fetch_reddit_sentiment(["wallstreetbets", "investing", "stocks", "ETFs", "Bogleheads", "dividends", "SecurityAnalysis", "ValueInvesting", "finance"], limit=100)
     reddit_block = summarize_reddit_sentiment(reddit_sentiment)
+    
+    # Extract top 3 stocks from Reddit analysis
+    top_reddit_stocks = get_top_reddit_stocks(reddit_sentiment, top_n=3)
+    top_stocks_block = format_top_reddit_stocks(top_reddit_stocks)
     # Personal config (edit these)
     user_profile = {
         "risk_tolerance": "medium-high",
@@ -562,7 +969,7 @@ def main():
         vix_line = f"VIX: {vix['close']:.2f} ({vix_chg:+.2f}%)"
 
     # ---------- PASS 1: ask for tickers JSON only ----------
-    # PROMPT INCLUDES: ✅ SPX/VIX data, ✅ Headlines, ✅ Reddit sentiment
+    # PROMPT INCLUDES: ✅ SPX/VIX data, ✅ Headlines, ✅ Reddit sentiment, ✅ Top Reddit stocks
     proposal_prompt = f"""
 You are selecting candidate tickers for a personal investing memo.
 Return ONLY valid JSON. No markdown, no commentary.
@@ -581,6 +988,8 @@ Constraints:
 - ETFs must be real tickers.
 - International can be ADRs or major non-US listings; keep widely traded.
 - Avoid duplicates across categories.
+- Make sure that the tickers provided are actually in the industries for which they are selected.
+- IMPORTANT: Consider the top Reddit stocks below - these are trending based on Reddit analysis.
 - User constraints: {", ".join(user_profile["constraints"])}
 
 Market snapshot:
@@ -591,6 +1000,8 @@ Headlines:
 {chr(10).join(f"- {h}" for h in headlines)}
 
 {reddit_block}
+
+{top_stocks_block}
 """
     proposal_raw = ask_llm(proposal_prompt)
 
@@ -631,11 +1042,12 @@ Headlines:
     yf_block = format_snapshots(snaps)
 
     # ---------- PASS 2: final memo using yfinance facts ----------
-    # PROMPT INCLUDES: ✅ SPX/VIX data, ✅ Headlines, ✅ Reddit sentiment, ✅ yfinance ticker data
+    # PROMPT INCLUDES: ✅ SPX/VIX data, ✅ Headlines, ✅ Reddit sentiment, ✅ Top Reddit stocks, ✅ yfinance ticker data
     final_prompt = f"""
 You are my personal investing memo writer. Be cautious, avoid certainty, avoid hype.
 Use Reddit sentiment only as context (noisy/contrarian), not predictive.
 Use the yfinance context below as factual input; do NOT invent metrics not shown.
+Pay special attention to the top Reddit stocks - these are trending based on Reddit analysis and may be worth considering.
 
 User context:
 - Risk tolerance: {user_profile["risk_tolerance"]}
@@ -652,11 +1064,13 @@ Headlines:
 
 {reddit_block}
 
+{top_stocks_block}
+
 {yf_block}
 
-Write the memo around 1000 words with:
+Write the memo around 1500 words with:
 1) 2 biggest market takeaways (tie to headlines)
-2) Risk regime (bullish/neutral/bearish) + 1 sentence justification (reference SPX/VIX + sentiment)
+2) Risk regime (bullish/neutral/bearish) + 1 sentence justification (reference SPX/VIX + reddit sentiment)
 3) Suggested actions (allocation/DCA/rebalancing/cash buffer)
 4) Picks: use ONLY the selected tickers below. For each category: 3 tickers + 2 quick bullets each.
 Selected tickers:
@@ -665,7 +1079,8 @@ Selected tickers:
 - AI/Software: {", ".join(proposal.get("ai_software", []))}
 - Robotics: {", ".join(proposal.get("robotics", []))}
 - International: {", ".join(proposal.get("international", []))}
-5) One thing to watch that could change the view
+5) Top Reddit stocks analysis: Provide a brief analysis of the top 3 Reddit stocks mentioned above, including why they're trending and whether they're worth considering (be cautious - Reddit sentiment can be contrarian/noisy).
+6) One thing to watch that could change the view
 """
     brief = ask_llm(final_prompt)
 
@@ -674,6 +1089,49 @@ Selected tickers:
     body = brief + f"\n\n Not Financial Advice -> Stock Bot created by Kuma McCraw leveraging {DEFAULT_MODEL} locally."
     send_email(subject, body)
 
+def should_run_on_startup():
+    """
+    Check if we should run on startup (missed the scheduled time).
+    Returns True if it's a weekday and we're past 9:15 AM but before 4:00 PM.
+    """
+    now = datetime.now()
+    weekday = now.weekday()  # 0 = Monday, 6 = Sunday
+    
+    # Only run on weekdays (Monday=0 to Friday=4)
+    if weekday >= 5:  # Saturday or Sunday
+        return False
+    
+    # Check if it's after 9:15 AM and before 4:00 PM (market hours)
+    current_time = now.time()
+    market_open = datetime.strptime("09:15", "%H:%M").time()
+    market_close = datetime.strptime("16:00", "%H:%M").time()
+    
+    if market_open <= current_time <= market_close:
+        return True
+    
+    return False
+
+def mark_as_run_today():
+    """Mark that we've run today by creating a flag file with today's date."""
+    flag_file = os.path.join(os.path.dirname(__file__), ".stockbot_run_today")
+    today = datetime.now().strftime("%Y-%m-%d")
+    with open(flag_file, "w") as f:
+        f.write(today)
+
+def has_run_today():
+    """Check if we've already run today."""
+    flag_file = os.path.join(os.path.dirname(__file__), ".stockbot_run_today")
+    if not os.path.exists(flag_file):
+        return False
+    
+    try:
+        with open(flag_file, "r") as f:
+            last_run = f.read().strip()
+        today = datetime.now().strftime("%Y-%m-%d")
+        return last_run == today
+    except:
+        return False
+
 if __name__ == "__main__":
     # Manual run options for testing:
     #   python Stock_Bot_V1_main_py --run-now   (or -r)  -> run once and exit
@@ -681,6 +1139,7 @@ if __name__ == "__main__":
     if "--run-now" in sys.argv or "-r" in sys.argv:
         print("Manual run requested (--run-now). Running once and exiting.")
         main()
+        mark_as_run_today()
         sys.exit(0)
 
     if "--prompt" in sys.argv or "-p" in sys.argv:
@@ -691,9 +1150,26 @@ if __name__ == "__main__":
         if ans == "y":
             print("Running now...")
             main()
+            mark_as_run_today()
             sys.exit(0)
         else:
             print("Continuing to scheduler...")
+
+    # Check if we should run on startup (missed scheduled time)
+    if "--startup-check" in sys.argv:
+        if should_run_on_startup() and not has_run_today():
+            logging.info("Startup check: Running bot (missed scheduled time)")
+            try:
+                main()
+                mark_as_run_today()
+            except Exception as e:
+                logging.error(f"Error running bot on startup: {e}")
+        else:
+            if has_run_today():
+                logging.info("Startup check: Already ran today, skipping")
+            else:
+                logging.info("Startup check: Not a weekday or outside market hours, skipping")
+        sys.exit(0)
 
     # Schedule the main function to run weekdays at 9:15 AM (before market open at 9:30 AM ET)
     schedule.every().monday.at("09:15").do(main)
